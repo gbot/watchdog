@@ -567,6 +567,27 @@ app.patch('/api/auth/profile', authMiddleware, async (req, res) => {
 });
 
 // ─── ADMIN ROUTES ─────────────────────────────────────────────────────────────
+app.post('/api/admin/users', adminMiddleware, async (req, res) => {
+  const { username, password, role } = req.body;
+  if (!username?.trim() || !password)
+    return res.status(400).json({ error: 'Username and password are required' });
+  if (username.trim().length < 3)
+    return res.status(400).json({ error: 'Username must be at least 3 characters' });
+  if (password.length < 6)
+    return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  const allowedRoles = ['user', 'superadmin'];
+  const assignedRole = allowedRoles.includes(role) ? role : 'user';
+
+  const existing = db.prepare('SELECT id FROM users WHERE LOWER(username) = LOWER(?)').get(username.trim());
+  if (existing) return res.status(409).json({ error: 'That username is already taken' });
+
+  const passwordHash = await bcrypt.hash(password, 12);
+  const user = { id: uuidv4(), username: username.trim(), passwordHash, role: assignedRole, createdAt: new Date().toISOString() };
+  db.prepare(`INSERT INTO users (id, username, passwordHash, role, createdAt) VALUES (?, ?, ?, ?, ?)`)
+    .run(user.id, user.username, user.passwordHash, user.role, user.createdAt);
+  res.status(201).json({ id: user.id, username: user.username, role: user.role });
+});
+
 app.get('/api/admin/users', adminMiddleware, (req, res) => {
   const users = db.prepare('SELECT id, username, email, role, createdAt, disabled, trackerLimit FROM users ORDER BY createdAt ASC').all();
   const trackerCounts = {};

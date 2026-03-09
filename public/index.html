@@ -938,6 +938,31 @@
     <div class="admin-body">
       <!-- Users tab -->
       <div id="adminUsersTab">
+        <!-- Add user form -->
+        <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;padding:12px 0 16px;border-bottom:1px solid var(--divider);margin-bottom:4px">
+          <div class="field" style="flex:1;min-width:120px;gap:4px">
+            <label style="font-size:11px;font-weight:600;color:var(--on-surface-medium);text-transform:uppercase;letter-spacing:0.5px">Username</label>
+            <input type="text" id="adminNewUsername" placeholder="username" autocomplete="off"
+              style="padding:7px 10px;border:1px solid var(--divider);border-radius:8px;font-size:13px;background:var(--surface);color:var(--on-surface)" />
+          </div>
+          <div class="field" style="flex:1;min-width:120px;gap:4px">
+            <label style="font-size:11px;font-weight:600;color:var(--on-surface-medium);text-transform:uppercase;letter-spacing:0.5px">Password</label>
+            <input type="password" id="adminNewPassword" placeholder="min 6 chars" autocomplete="new-password"
+              style="padding:7px 10px;border:1px solid var(--divider);border-radius:8px;font-size:13px;background:var(--surface);color:var(--on-surface)" />
+          </div>
+          <div class="field" style="min-width:100px;gap:4px">
+            <label style="font-size:11px;font-weight:600;color:var(--on-surface-medium);text-transform:uppercase;letter-spacing:0.5px">Role</label>
+            <select id="adminNewRole"
+              style="padding:7px 10px;border:1px solid var(--divider);border-radius:8px;font-size:13px;background:var(--surface);color:var(--on-surface)">
+              <option value="user">User</option>
+              <option value="superadmin">Super Admin</option>
+            </select>
+          </div>
+          <button class="btn btn-primary" style="height:36px;white-space:nowrap" onclick="adminAddUser()">
+            <span class="material-icons" style="font-size:16px">person_add</span> Add user
+          </button>
+        </div>
+        <p class="profile-msg" id="adminAddUserMsg" style="margin:0 0 8px"></p>
         <table class="admin-table">
           <thead>
             <tr>
@@ -1261,6 +1286,39 @@ async function loadAdminTab(tab) {
         <td style="text-align:center">${t.changeCount || 0}</td>
         <td><button class="btn-icon" style="color:var(--error)" title="Delete tracker" onclick="adminDeleteTracker('${t.id}','${escHtml(t.label || t.url)}')"><span class="material-icons" style="font-size:18px">delete_outline</span></button></td>
       </tr>`).join('');
+  }
+}
+
+async function adminAddUser() {
+  const username = document.getElementById('adminNewUsername').value.trim();
+  const password = document.getElementById('adminNewPassword').value;
+  const role     = document.getElementById('adminNewRole').value;
+  const msgEl    = document.getElementById('adminAddUserMsg');
+  msgEl.textContent = '';
+  msgEl.className   = 'profile-msg';
+
+  if (!username || !password) {
+    msgEl.textContent = 'Username and password are required.';
+    msgEl.classList.add('error');
+    return;
+  }
+
+  const res  = await fetch('/api/admin/users', {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ username, password, role }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    msgEl.textContent = data.error || 'Failed to create user.';
+    msgEl.classList.add('error');
+  } else {
+    msgEl.textContent = `User "${data.username}" created.`;
+    msgEl.classList.add('success');
+    document.getElementById('adminNewUsername').value = '';
+    document.getElementById('adminNewPassword').value = '';
+    document.getElementById('adminNewRole').value = 'user';
+    loadAdminTab('users');
   }
 }
 
