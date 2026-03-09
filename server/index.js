@@ -33,7 +33,10 @@ db.pragma('foreign_keys = ON');
 
 // Migrate existing DB if email column not yet present
 try { db.exec('ALTER TABLE users ADD COLUMN email TEXT'); } catch {}
-try { db.exec('ALTER TABLE users ADD COLUMN role  TEXT NOT NULL DEFAULT \'user\''); } catch {}
+try { db.exec('ALTER TABLE users ADD COLUMN role              TEXT    NOT NULL DEFAULT \'user\''); } catch {}
+try { db.exec('ALTER TABLE users ADD COLUMN disabled          INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE users ADD COLUMN trackerLimit      INTEGER'); } catch {}
+try { db.exec('ALTER TABLE users ADD COLUMN notificationsEnabled INTEGER NOT NULL DEFAULT 1'); } catch {}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
@@ -421,10 +424,14 @@ function authMiddleware(req, res, next) {
   if (!token) return res.status(401).json({ error: 'Not authenticated' });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const userExists = db.prepare('SELECT id FROM users WHERE id = ?').get(payload.userId);
-    if (!userExists) {
+    const user = db.prepare('SELECT id, role, disabled FROM users WHERE id = ?').get(payload.userId);
+    if (!user) {
       res.clearCookie('watchdog_auth');
       return res.status(401).json({ error: 'Account no longer exists' });
+    }
+    if (user.disabled) {
+      res.clearCookie('watchdog_auth');
+      return res.status(403).json({ error: 'Account is disabled' });
     }
     req.userId   = payload.userId;
     req.username = payload.username;
@@ -463,7 +470,7 @@ app.post('/api/auth/register', async (req, res) => {
 
   const token = jwt.sign({ userId: user.id, username: user.username, role: 'user' }, JWT_SECRET, { expiresIn: '7d' });
   res.cookie('watchdog_auth', token, { httpOnly: true, sameSite: 'lax', maxAge: COOKIE_MAX_AGE });
-  res.status(201).json({ id: user.id, username: user.username, role: 'user' });
+  res.status(201).json({ id: user.id, username: user.username, role: 'user', notificationsEnabled: true });
 });
 
 app.post('/api/auth/login', async (req, res) => {
@@ -480,7 +487,7 @@ app.post('/api/auth/login', async (req, res) => {
 
   const token = jwt.sign({ userId: user.id, username: user.username, role: user.role || 'user' }, JWT_SECRET, { expiresIn: '7d' });
   res.cookie('watchdog_auth', token, { httpOnly: true, sameSite: 'lax', maxAge: COOKIE_MAX_AGE });
-  res.json({ id: user.id, username: user.username, role: user.role || 'user' });
+  res.json({ id: user.id, username: user.username, role: user.role || 'user', notificationsEnabled: user.notificationsEnabled !== 0 });
 });
 
 app.post('/api/auth/logout', (req, res) => {
@@ -493,22 +500,41 @@ app.get('/api/auth/me', (req, res) => {
   if (!token) return res.status(401).json({ error: 'Not authenticated' });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    res.json({ id: payload.userId, username: payload.username, role: payload.role || 'user' });
+    const user = db.prepare('SELECT role, disabled, notificationsEnabled FROM users WHERE id = ?').get(payload.userId);
+    if (!user || user.disabled) return res.status(401).json({ error: 'Not authenticated' });
+    res.json({ id: payload.userId, username: payload.username, role: user.role || 'user', notificationsEnabled: user.notificationsEnabled !== 0 });
   } catch {
     res.status(401).json({ error: 'Invalid or expired session' });
   }
 });
 
 app.get('/api/auth/profile', authMiddleware, (req, res) => {
-  const user = db.prepare('SELECT id, username, email, createdAt FROM users WHERE id = ?').get(req.userId);
+  const user = db.prepare('SELECT id, username, email, createdAt, notificationsEnabled FROM users WHERE id = ?').get(req.userId);
   if (!user) return res.status(404).json({ error: 'User not found' });
-  res.json(user);
+  res.json({ ...user, notificationsEnabled: user.notificationsEnabled !== 0 });
+});
+
+app.delete('/api/auth/profile', authMiddleware, async (req, res) => {
+  const { password } = req.body;
+  if (!password) return res.status(400).json({ error: 'Password is required to delete your account' });
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  const ok = await bcrypt.compare(password, user.passwordHash);
+  if (!ok) return res.status(401).json({ error: 'Incorrect password' });
+
+  trackers.filter(t => t.userId === req.userId).forEach(t => stopTrackerTimer(t.id));
+  trackers = trackers.filter(t => t.userId !== req.userId);
+  db.prepare('DELETE FROM changes WHERE trackerId IN (SELECT id FROM trackers WHERE userId = ?)').run(req.userId);
+  db.prepare('DELETE FROM trackers WHERE userId = ?').run(req.userId);
+  db.prepare('DELETE FROM users WHERE id = ?').run(req.userId);
+  res.clearCookie('watchdog_auth');
+  res.json({ success: true });
 });
 
 app.patch('/api/auth/profile', authMiddleware, async (req, res) => {
   const { email, currentPassword, newPassword } = req.body;
 
-  if (email === undefined && newPassword === undefined)
+  if (email === undefined && newPassword === undefined && req.body.notificationsEnabled === undefined)
     return res.status(400).json({ error: 'Nothing to update' });
 
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
@@ -519,6 +545,11 @@ app.patch('/api/auth/profile', authMiddleware, async (req, res) => {
     if (trimmed && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed))
       return res.status(400).json({ error: 'Invalid email address' });
     db.prepare('UPDATE users SET email = ? WHERE id = ?').run(trimmed || null, req.userId);
+  }
+
+  if (req.body.notificationsEnabled !== undefined) {
+    db.prepare('UPDATE users SET notificationsEnabled = ? WHERE id = ?')
+      .run(req.body.notificationsEnabled ? 1 : 0, req.userId);
   }
 
   if (newPassword !== undefined) {
@@ -537,10 +568,42 @@ app.patch('/api/auth/profile', authMiddleware, async (req, res) => {
 
 // ─── ADMIN ROUTES ─────────────────────────────────────────────────────────────
 app.get('/api/admin/users', adminMiddleware, (req, res) => {
-  const users = db.prepare('SELECT id, username, email, role, createdAt FROM users ORDER BY createdAt ASC').all();
+  const users = db.prepare('SELECT id, username, email, role, createdAt, disabled, trackerLimit FROM users ORDER BY createdAt ASC').all();
   const trackerCounts = {};
   trackers.forEach(t => { trackerCounts[t.userId] = (trackerCounts[t.userId] || 0) + 1; });
-  res.json(users.map(u => ({ ...u, trackerCount: trackerCounts[u.id] || 0 })));
+  res.json(users.map(u => ({ ...u, disabled: u.disabled === 1, trackerCount: trackerCounts[u.id] || 0 })));
+});
+
+app.patch('/api/admin/users/:id', adminMiddleware, (req, res) => {
+  const targetId = req.params.id;
+  if (targetId === req.userId) return res.status(400).json({ error: 'Cannot modify your own account this way' });
+  const user = db.prepare('SELECT id FROM users WHERE id = ?').get(targetId);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
+  const { disabled, trackerLimit } = req.body;
+
+  if (disabled !== undefined) {
+    db.prepare('UPDATE users SET disabled = ? WHERE id = ?').run(disabled ? 1 : 0, targetId);
+    if (disabled) {
+      // Force-logout active sessions
+      const msg = `data: ${JSON.stringify({ type: 'force_logout' })}\n\n`;
+      sseClients.forEach((client, clientId) => {
+        if (client.userId === targetId) {
+          try { client.res.write(msg); client.res.end(); } catch {}
+          sseClients.delete(clientId);
+        }
+      });
+    }
+  }
+
+  if (trackerLimit !== undefined) {
+    const limit = trackerLimit === null ? null : parseInt(trackerLimit);
+    if (limit !== null && (isNaN(limit) || limit < 0))
+      return res.status(400).json({ error: 'Invalid tracker limit' });
+    db.prepare('UPDATE users SET trackerLimit = ? WHERE id = ?').run(limit, targetId);
+  }
+
+  res.json({ success: true });
 });
 
 app.delete('/api/admin/users/:id', adminMiddleware, (req, res) => {
@@ -600,6 +663,13 @@ app.post('/api/trackers', authMiddleware, async (req, res) => {
   const { url, label, interval, aiSummary } = req.body;
   if (!url) return res.status(400).json({ error: 'url is required' });
   try { new URL(url); } catch { return res.status(400).json({ error: 'Invalid URL' }); }
+
+  const userRow = db.prepare('SELECT trackerLimit FROM users WHERE id = ?').get(req.userId);
+  if (userRow?.trackerLimit != null) {
+    const count = trackers.filter(t => t.userId === req.userId).length;
+    if (count >= userRow.trackerLimit)
+      return res.status(403).json({ error: `Tracker limit reached (${userRow.trackerLimit})` });
+  }
 
   const tracker = {
     id: uuidv4(), url,

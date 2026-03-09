@@ -562,6 +562,32 @@
   }
   .admin-role-superadmin { background: #e8f0fe; color: var(--primary); }
   .admin-role-user { background: var(--background); color: var(--on-surface-medium); }
+  .admin-disabled-badge {
+    font-size: 11px; font-weight: 600;
+    padding: 2px 8px; border-radius: 20px;
+    text-transform: uppercase; letter-spacing: 0.3px;
+    background: #fce8e6; color: var(--error);
+  }
+  /* Toggle switch */
+  .toggle-switch {
+    position: relative; display: inline-flex; align-items: center; gap: 8px;
+    cursor: pointer; user-select: none; font-size: 13px;
+  }
+  .toggle-switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+  .toggle-track {
+    width: 34px; height: 20px; border-radius: 10px;
+    background: var(--on-surface-light);
+    transition: background 0.2s;
+    flex-shrink: 0;
+    position: relative;
+  }
+  .toggle-track::after {
+    content: ''; position: absolute; top: 3px; left: 3px;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: white; transition: left 0.2s;
+  }
+  .toggle-switch input:checked + .toggle-track { background: var(--primary); }
+  .toggle-switch input:checked + .toggle-track::after { left: 17px; }
   .admin-url {
     font-family: 'DM Mono', monospace;
     font-size: 11px; color: var(--on-surface-medium);
@@ -919,6 +945,8 @@
               <th>Email</th>
               <th>Role</th>
               <th>Trackers</th>
+              <th>Limit</th>
+              <th>Status</th>
               <th>Joined</th>
               <th></th>
             </tr>
@@ -993,10 +1021,36 @@
       <p class="profile-msg" id="profilePwMsg"></p>
       <button class="btn btn-primary" style="width:100%;justify-content:center" onclick="saveProfilePassword()">Change password</button>
     </div>
+    <div class="profile-divider"></div>
+
+    <!-- Notifications -->
+    <div class="profile-section">
+      <div class="profile-section-title">Notifications</div>
+      <label class="toggle-switch" style="font-size:14px;color:var(--on-surface)">
+        <input type="checkbox" id="profileNotifications" onchange="saveProfileNotifications(this.checked)">
+        <span class="toggle-track"></span>
+        Browser notifications
+      </label>
+      <p style="font-size:12px;color:var(--on-surface-medium);margin:0">Show a browser notification when a tracker detects a change.</p>
+    </div>
+
+    <div class="profile-divider"></div>
+
+    <!-- Delete account -->
+    <div class="profile-section">
+      <div class="profile-section-title" style="color:var(--error)">Danger zone</div>
+      <p style="font-size:13px;color:var(--on-surface-medium);margin:0">Permanently delete your account and all your trackers. This cannot be undone.</p>
+      <div class="field">
+        <label for="profileDeletePw">Confirm with your password</label>
+        <input type="password" id="profileDeletePw" placeholder="Enter your password" autocomplete="current-password" />
+      </div>
+      <p class="profile-msg" id="profileDeleteMsg"></p>
+      <button class="btn" style="background:#fce8e6;color:var(--error);width:100%;justify-content:center;border:1px solid #f5c6c3" onclick="deleteAccount()">
+        <span class="material-icons" style="font-size:16px">delete_forever</span> Delete my account
+      </button>
+    </div>
   </div>
 </div>
-
-<!-- SNACKBAR -->
 <div class="notification-bar" id="snackbar">
   <span class="material-icons">notifications</span>
   <span id="snackbarText">Change detected!</span>
@@ -1039,9 +1093,6 @@ async function init() {
     }
   } catch {
     showAuthOverlay('login');
-  }
-  if (Notification.permission !== 'granted' && Notification.permission !== 'denied') {
-    Notification.requestPermission();
   }
 }
 
@@ -1174,13 +1225,20 @@ async function loadAdminTab(tab) {
     if (!res.ok) return;
     const users = await res.json();
     const tbody = document.getElementById('adminUsersBody');
-    if (!users.length) { tbody.innerHTML = `<tr><td colspan="6" class="admin-empty">No users found.</td></tr>`; return; }
+    if (!users.length) { tbody.innerHTML = `<tr><td colspan="8" class="admin-empty">No users found.</td></tr>`; return; }
     tbody.innerHTML = users.map(u => `
       <tr>
         <td><strong>${escHtml(u.username)}</strong></td>
         <td>${u.email ? escHtml(u.email) : '<span style="color:var(--on-surface-light)">—</span>'}</td>
         <td><span class="admin-role-badge admin-role-${u.role === 'superadmin' ? 'superadmin' : 'user'}">${u.role === 'superadmin' ? 'Super Admin' : 'User'}</span></td>
         <td>${u.trackerCount}</td>
+        <td>${u.id === currentUser.id ? '—' : `<input type="number" min="0" value="${u.trackerLimit ?? ''}" placeholder="∞"
+          style="width:56px;padding:3px 6px;border:1px solid var(--divider);border-radius:6px;font-size:12px;background:var(--surface)"
+          onchange="adminSetTrackerLimit('${u.id}', this.value)" title="Max trackers (blank = unlimited)" />`}</td>
+        <td>${u.id === currentUser.id ? '' : `<label class="toggle-switch" title="${u.disabled ? 'Enable' : 'Disable'} account">
+          <input type="checkbox" ${u.disabled ? '' : 'checked'} onchange="adminToggleDisabled('${u.id}', !this.checked)">
+          <span class="toggle-track"></span>
+        </label>`}</td>
         <td style="color:var(--on-surface-medium);font-size:12px">${new Date(u.createdAt).toLocaleDateString()}</td>
         <td>${u.id === currentUser.id ? '' : `<button class="btn-icon" style="color:var(--error)" title="Delete user" onclick="adminDeleteUser('${u.id}','${escHtml(u.username)}')"><span class="material-icons" style="font-size:18px">person_remove</span></button>`}</td>
       </tr>`).join('');
@@ -1214,6 +1272,33 @@ async function adminDeleteUser(id, username) {
   else { const d = await res.json(); showSnackbar(d.error || 'Delete failed', 'error'); }
 }
 
+async function adminToggleDisabled(id, disable) {
+  const res = await fetch(`/api/admin/users/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ disabled: disable }),
+  });
+  if (res.ok) {
+    showSnackbar(disable ? 'Account disabled.' : 'Account enabled.');
+    loadAdminTab('users');
+  } else {
+    const d = await res.json();
+    showSnackbar(d.error || 'Update failed', 'error');
+    loadAdminTab('users'); // revert toggle in UI
+  }
+}
+
+async function adminSetTrackerLimit(id, value) {
+  const limit = value === '' ? null : parseInt(value);
+  const res = await fetch(`/api/admin/users/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ trackerLimit: limit }),
+  });
+  if (res.ok) showSnackbar('Tracker limit updated.');
+  else { const d = await res.json(); showSnackbar(d.error || 'Update failed', 'error'); }
+}
+
 async function adminDeleteTracker(id, label) {
   const ok = await openDeleteConfirmDialog(`tracker "${label}"`);
   if (!ok) return;
@@ -1228,9 +1313,14 @@ async function openProfile() {
   document.getElementById('profilePwMsg').textContent    = '';
   document.getElementById('profileEmailMsg').className   = 'profile-msg';
   document.getElementById('profilePwMsg').className      = 'profile-msg';
-  document.getElementById('profileCurrentPw').value      = '';
-  document.getElementById('profileNewPw').value          = '';
-  document.getElementById('profileConfirmPw').value      = '';
+  document.getElementById('profileCurrentPw').value = '';
+  document.getElementById('profileNewPw').value      = '';
+  document.getElementById('profileConfirmPw').value  = '';
+  document.getElementById('profileDeletePw').value   = '';
+  if (document.getElementById('profileDeleteMsg')) {
+    document.getElementById('profileDeleteMsg').textContent = '';
+    document.getElementById('profileDeleteMsg').className   = 'profile-msg';
+  }
   document.getElementById('profileUsernameDisplay').textContent = currentUser?.username || '';
 
   try {
@@ -1238,6 +1328,7 @@ async function openProfile() {
     if (res.ok) {
       const profile = await res.json();
       document.getElementById('profileEmail').value = profile.email || '';
+      document.getElementById('profileNotifications').checked = profile.notificationsEnabled !== false;
     }
   } catch {}
 
@@ -1320,6 +1411,58 @@ async function saveProfilePassword() {
       document.getElementById('profileCurrentPw').value = '';
       document.getElementById('profileNewPw').value     = '';
       document.getElementById('profileConfirmPw').value  = '';
+    }
+  } catch {
+    msgEl.textContent = 'Connection error.';
+    msgEl.classList.add('error');
+  }
+}
+
+async function saveProfileNotifications(enabled) {
+  try {
+    await fetch('/api/auth/profile', {
+      method:  'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ notificationsEnabled: enabled }),
+    });
+    if (currentUser) currentUser.notificationsEnabled = enabled;
+    if (enabled && Notification.permission !== 'granted' && Notification.permission !== 'denied') {
+      Notification.requestPermission();
+    }
+  } catch {}
+}
+
+async function deleteAccount() {
+  const pw    = document.getElementById('profileDeletePw').value;
+  const msgEl = document.getElementById('profileDeleteMsg');
+  msgEl.textContent = '';
+  msgEl.className   = 'profile-msg';
+  if (!pw) {
+    msgEl.textContent = 'Please enter your password to confirm.';
+    msgEl.classList.add('error');
+    return;
+  }
+  const ok = await openDeleteConfirmDialog('your account and all your trackers');
+  if (!ok) return;
+  try {
+    const res  = await fetch('/api/auth/profile', {
+      method:  'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ password: pw }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      msgEl.textContent = data.error || 'Failed to delete account';
+      msgEl.classList.add('error');
+    } else {
+      closeProfile();
+      if (evtSource) { evtSource.close(); evtSource = null; }
+      currentUser = null;
+      trackers    = [];
+      renderTrackers();
+      updateBadge();
+      document.getElementById('userArea').style.display = 'none';
+      showAuthOverlay('login');
     }
   } catch {
     msgEl.textContent = 'Connection error.';
@@ -1771,6 +1914,7 @@ function updateBadge() {
 
 // ─── NOTIFICATIONS ────────────────────────────────────────────────────────────
 function triggerBrowserNotification(label, url) {
+  if (!currentUser?.notificationsEnabled) return;
   if (Notification.permission === 'granted') {
     new Notification('Watchdog: Change detected', {
       body: `${label}\n${url}`,
