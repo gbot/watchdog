@@ -20,46 +20,130 @@ app.use(express.json());
 app.use(cookieParser());
 app.use(express.static(path.join(__dirname, '../public')));
 
-// ─── PERSISTENCE ──────────────────────────────────────────────────────────────
-const DB_FILE      = path.join(__dirname, '../data/trackers.json');
-const CHANGES_FILE = path.join(__dirname, '../data/changes.json');
-const USERS_FILE   = path.join(__dirname, '../data/users.json');
+// ─── PERSISTENCE (SQLite) ─────────────────────────────────────────────────────
+const Database = require('better-sqlite3');
+const DATA_DIR  = path.join(__dirname, '../data');
+const DB_PATH   = path.join(DATA_DIR, 'watchdog.db');
 
-function ensureDataDir() {
-  const dir = path.dirname(DB_FILE);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+const db = new Database(DB_PATH);
+db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id           TEXT PRIMARY KEY,
+    username     TEXT UNIQUE NOT NULL,
+    passwordHash TEXT NOT NULL,
+    createdAt    TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS trackers (
+    id            TEXT PRIMARY KEY,
+    userId        TEXT NOT NULL REFERENCES users(id),
+    label         TEXT,
+    url           TEXT,
+    interval      INTEGER DEFAULT 30000,
+    active        INTEGER DEFAULT 1,
+    status        TEXT    DEFAULT 'pending',
+    lastCheck     TEXT,
+    lastHash      TEXT,
+    lastBody      TEXT,
+    httpStatus    INTEGER,
+    changeCount   INTEGER DEFAULT 0,
+    changeSummary TEXT,
+    changeSnippet TEXT,
+    error         TEXT,
+    aiSummary     INTEGER DEFAULT 1,
+    createdAt     TEXT,
+    position      INTEGER DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS changes (
+    id           TEXT PRIMARY KEY,
+    trackerId    TEXT NOT NULL,
+    trackerLabel TEXT,
+    url          TEXT,
+    detectedAt   TEXT,
+    summary      TEXT,
+    oldHash      TEXT,
+    newHash      TEXT
+  );
+`);
+
+function rowToTracker(row) {
+  return {
+    ...row,
+    active:       row.active    === 1,
+    aiSummary:    row.aiSummary !== 0,
+    changeSnippet: row.changeSnippet ? JSON.parse(row.changeSnippet) : null,
+  };
 }
 
 function loadTrackers() {
-  ensureDataDir();
-  if (!fs.existsSync(DB_FILE)) return [];
-  try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
-  catch { return []; }
+  return db.prepare('SELECT * FROM trackers ORDER BY position ASC').all().map(rowToTracker);
 }
 
 function loadChanges() {
-  ensureDataDir();
-  if (!fs.existsSync(CHANGES_FILE)) return [];
-  try { return JSON.parse(fs.readFileSync(CHANGES_FILE, 'utf8')); }
-  catch { return []; }
+  return db.prepare('SELECT * FROM changes ORDER BY detectedAt DESC').all();
 }
 
 function loadUsers() {
-  ensureDataDir();
-  if (!fs.existsSync(USERS_FILE)) return [];
-  try { return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); }
-  catch { return []; }
+  return db.prepare('SELECT * FROM users').all();
 }
 
 function saveUsers(users) {
-  ensureDataDir();
-  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
+  const upsert = db.prepare(`
+    INSERT INTO users (id, username, passwordHash, createdAt)
+    VALUES (@id, @username, @passwordHash, @createdAt)
+    ON CONFLICT(id) DO UPDATE SET
+      username=excluded.username,
+      passwordHash=excluded.passwordHash
+  `);
+  db.transaction(() => users.forEach(u => upsert.run(u)))();
 }
 
+const _upsertTracker = db.prepare(`
+  INSERT INTO trackers
+    (id, userId, label, url, interval, active, status, lastCheck, lastHash,
+     lastBody, httpStatus, changeCount, changeSummary, changeSnippet, error,
+     aiSummary, createdAt, position)
+  VALUES
+    (@id, @userId, @label, @url, @interval, @active, @status, @lastCheck, @lastHash,
+     @lastBody, @httpStatus, @changeCount, @changeSummary, @changeSnippet, @error,
+     @aiSummary, @createdAt, @position)
+  ON CONFLICT(id) DO UPDATE SET
+    label=excluded.label, url=excluded.url, interval=excluded.interval,
+    active=excluded.active, status=excluded.status, lastCheck=excluded.lastCheck,
+    lastHash=excluded.lastHash, lastBody=excluded.lastBody, httpStatus=excluded.httpStatus,
+    changeCount=excluded.changeCount, changeSummary=excluded.changeSummary,
+    changeSnippet=excluded.changeSnippet, error=excluded.error,
+    aiSummary=excluded.aiSummary, position=excluded.position
+`);
+
 function saveTrackers(list) {
-  ensureDataDir();
-  fs.writeFileSync(DB_FILE, JSON.stringify(list, null, 2));
-  // Broadcast per-user so each SSE client only receives their own trackers
+  const incomingIds = list.map(t => t.id);
+  db.transaction(() => {
+    list.forEach((t, i) => {
+      _upsertTracker.run({
+        ...t,
+        active:        t.active       ? 1 : 0,
+        aiSummary:     t.aiSummary === false ? 0 : 1,
+        changeSnippet: t.changeSnippet ? JSON.stringify(t.changeSnippet) : null,
+        position:      i,
+      });
+    });
+    // Remove DB rows no longer present in the in-memory list
+    if (incomingIds.length > 0) {
+      const placeholders = incomingIds.map(() => '?').join(',');
+      db.prepare(`DELETE FROM trackers WHERE id NOT IN (${placeholders})`).run(...incomingIds);
+    } else {
+      db.prepare('DELETE FROM trackers').run();
+    }
+  })();
+
+  // SSE broadcast per-user, strip lastBody
   const byUser = {};
   list.forEach(t => {
     const uid = t.userId || '_anon';
@@ -73,9 +157,16 @@ function saveTrackers(list) {
 }
 
 function saveChange(change) {
-  const changes = loadChanges();
-  changes.unshift(change);
-  fs.writeFileSync(CHANGES_FILE, JSON.stringify(changes.slice(0, 500), null, 2));
+  db.prepare(`
+    INSERT INTO changes (id, trackerId, trackerLabel, url, detectedAt, summary, oldHash, newHash)
+    VALUES (@id, @trackerId, @trackerLabel, @url, @detectedAt, @summary, @oldHash, @newHash)
+  `).run(change);
+  // Keep only the most recent 500 change records
+  db.prepare(`
+    DELETE FROM changes WHERE id NOT IN (
+      SELECT id FROM changes ORDER BY detectedAt DESC LIMIT 500
+    )
+  `).run();
 }
 
 let trackers = loadTrackers();
