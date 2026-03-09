@@ -1057,6 +1057,9 @@
         Browser notifications
       </label>
       <p style="font-size:12px;color:var(--on-surface-medium);margin:0">Show a browser notification when a tracker detects a change.</p>
+      <button class="btn btn-text" style="align-self:flex-start;padding:4px 0" onclick="sendTestNotification()">
+        <span class="material-icons" style="font-size:16px">notifications_active</span> Send test notification
+      </button>
     </div>
 
     <div class="profile-divider"></div>
@@ -1156,6 +1159,9 @@ function showApp() {
   document.getElementById('userArea').style.display  = 'flex';
   const adminBtn = document.getElementById('adminPanelBtn');
   adminBtn.style.display = currentUser.role === 'superadmin' ? 'flex' : 'none';
+  if (currentUser.notificationsEnabled && Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
   connectSSE();
 }
 
@@ -1473,6 +1479,21 @@ async function saveProfilePassword() {
   } catch {
     msgEl.textContent = 'Connection error.';
     msgEl.classList.add('error');
+  }
+}
+
+function sendTestNotification() {
+  if (Notification.permission === 'granted') {
+    new Notification('Watchdog: Notifications working!', {
+      body: 'Browser notifications are enabled and working correctly.',
+      icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="%231a73e8"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>'
+    });
+  } else if (Notification.permission === 'denied') {
+    showSnackbar('Notifications are blocked in your browser settings.', 'error');
+  } else {
+    Notification.requestPermission().then(p => {
+      if (p === 'granted') sendTestNotification();
+    });
   }
 }
 
