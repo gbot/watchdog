@@ -940,6 +940,7 @@ function connectSSE() {
       if (data.type === 'update') {
         trackers.forEach(t => {
           if (t.status === 'changed' && prevStatuses[t.id] !== 'changed') {
+            delete _tcCache[t.id]; // invalidate so fresh history is fetched
             showSnackbar(`🔔 Change detected: ${t.label}`);
             triggerBrowserNotification(t.label, t.url);
           }
@@ -1106,6 +1107,288 @@ async function invertAll() {
   }
 }
 
+// ─── TRACKER CHANGE HISTORY ───────────────────────────────────────────────────
+
+function _tcBuildHTML(t, cache) {
+  const isNew      = t.status === 'changed';
+  const collapsed  = _tcCollapsed.has(t.id);
+  const toggleIcon = collapsed ? 'expand_more' : 'expand_less';
+  const toggleTitle = collapsed ? 'Show history' : 'Hide history';
+
+  const unreadCount  = cache?.loaded
+    ? cache.items.filter(i => !i.dismissed && !i.locked).length
+    : (isNew ? 1 : 0);
+  const showUnreadBadge = isNew || unreadCount > 0;
+  const badgeLabel      = unreadCount > 1 ? `${unreadCount} unread` : 'UNREAD';
+
+  let html = `<div class="tc-header">
+    <span class="material-icons" style="font-size:16px;flex-shrink:0;color:var(--on-surface-medium)">history</span>
+    <span class="tc-title">Change history</span>
+    ${showUnreadBadge ? `<span class="tc-unread-badge">${badgeLabel}</span>` : ''}
+    ${showUnreadBadge && unreadCount > 0 ? `<button class="btn btn-text tc-mark-all-read-btn" onclick="_tcDismissAll('${t.id}')">Mark all read</button>` : ''}
+    <span style="flex:1"></span>
+    <button class="tc-icon-btn" title="${toggleTitle}" onclick="_tcToggleHistory('${t.id}')">
+      <span class="material-icons tc-toggle-btn-icon">${toggleIcon}</span>
+    </button>
+    <button class="tc-icon-btn tc-icon-btn-delete" title="Delete all history" onclick="_tcDeleteHistory('${t.id}')">
+      <span class="material-icons">delete_outline</span>
+    </button>
+  </div>`;
+
+  if (collapsed) return html;
+
+  html += `<div class="tc-body">`;
+
+  if (!cache?.loaded) {
+    // Show current summary from tracker state as a placeholder while history loads
+    if (t.changeSummary) {
+      const hasSnippet = isNew && t.changeSnippet;
+      html += `<div class="tc-entry tc-entry-new">
+        <div class="tc-entry-row">
+          <span class="tc-unread-dot" title="Unread"></span>
+          <div class="tc-entry-meta">Just now</div>
+          <span style="flex:1"></span>
+        </div>
+        <div class="diff-summary">${renderSummary(t.changeSummary)}</div>
+        ${hasSnippet ? `<button class="btn btn-text" style="padding:3px 10px;font-size:12px;white-space:nowrap" onclick="toggleDiffPanel('${t.id}',this)">Show changes</button>` : ''}
+      </div>
+      ${hasSnippet ? `<div class="diff-panel" id="diff-panel-${t.id}">
+        <div class="diff-panel-inner">
+          <div class="diff-block diff-removed"><div class="diff-block-label">Before</div>${escHtml(t.changeSnippet.removed)}</div>
+          <div class="diff-block diff-added"><div class="diff-block-label">After</div>${escHtml(t.changeSnippet.added)}</div>
+        </div>
+      </div>` : ''}`;
+    }
+    if (!cache || cache.loading) {
+      html += `<div class="tc-loading">Loading history\u2026</div>`;
+    }
+    html += `</div>`;
+    return html;
+  }
+
+  // Cache is loaded — render stacked history entries (newest first)
+  cache.items.forEach((item, idx) => {
+    const entryUnread = !item.dismissed && !item.locked;
+    const hasSnippet  = idx === 0 && t.changeSnippet;
+    const dateStr     = new Date(item.detectedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    html += `<div class="tc-entry${entryUnread ? ' tc-entry-unread' : ' tc-entry-read'}${item.locked ? ' tc-entry-locked' : ''}">
+      <div class="tc-entry-row">
+        ${entryUnread ? `<span class="tc-unread-dot" title="Unread"></span>` : '<span class="tc-read-dot" title="Read"></span>'}
+        <div class="tc-entry-meta">${timeAgo(item.detectedAt)} &middot; ${dateStr}</div>
+        <span style="flex:1"></span>
+        ${item.locked ? '' : (entryUnread ? `<button class="btn btn-text tc-mark-read-btn" onclick="_tcDismissChange('${item.id}','${t.id}')">Mark read</button>` : '<span class="tc-read-label">Read</span>')}
+        <button class="tc-icon-btn tc-lock-btn${item.locked ? ' tc-lock-btn-active' : ''}" title="${item.locked ? 'Unlock this change' : 'Lock this change'}" onclick="_tcLockChange('${item.id}','${t.id}')">
+          <span class="material-icons">${item.locked ? 'lock' : 'lock_open'}</span>
+        </button>
+      </div>
+      <div class="diff-summary">${renderSummary(item.summary || '')}</div>
+      ${hasSnippet ? `<button class="btn btn-text" style="padding:3px 10px;font-size:12px;white-space:nowrap" onclick="toggleDiffPanel('${t.id}',this)">Show changes</button>` : ''}
+    </div>
+    ${hasSnippet ? `<div class="diff-panel" id="diff-panel-${t.id}">
+      <div class="diff-panel-inner">
+        <div class="diff-block diff-removed"><div class="diff-block-label">Before</div>${escHtml(t.changeSnippet.removed)}</div>
+        <div class="diff-block diff-added"><div class="diff-block-label">After</div>${escHtml(t.changeSnippet.added)}</div>
+      </div>
+    </div>` : ''}`;
+  });
+
+  if (cache.total > cache.items.length) {
+    const remaining = Math.min(5, cache.total - cache.items.length);
+    html += `<button class="btn btn-text tc-load-more" onclick="_tcLoadMore('${t.id}')">Load ${remaining} more change${remaining !== 1 ? 's' : ''}</button>`;
+  }
+
+  html += `</div>`;
+  return html;
+}
+
+async function _tcFetch(trackerId, append = false) {
+  if (!_tcCache[trackerId]) {
+    _tcCache[trackerId] = { items: [], total: 0, loaded: false, loading: false };
+  }
+  if (_tcCache[trackerId].loading) return;
+  _tcCache[trackerId].loading = true;
+
+  const offset = append ? _tcCache[trackerId].items.length : 0;
+  try {
+    const res = await fetch(`/api/trackers/${trackerId}/changes?limit=5&offset=${offset}`);
+    if (!res.ok) { _tcCache[trackerId].loading = false; return; }
+    const { items, total } = await res.json();
+    if (append) {
+      _tcCache[trackerId].items.push(...items);
+    } else {
+      _tcCache[trackerId].items = items;
+    }
+    _tcCache[trackerId].total   = total;
+    _tcCache[trackerId].loaded  = true;
+    _tcCache[trackerId].loading = false;
+    _tcUpdate(trackerId);
+  } catch {
+    _tcCache[trackerId].loading = false;
+  }
+}
+
+function _tcUpdate(trackerId) {
+  const container = document.getElementById(`tc-history-${trackerId}`);
+  if (!container) return;
+  const t = trackers.find(t => t.id === trackerId);
+  if (!t) return;
+  // Preserve diff panel open state before rebuilding
+  const diffPanel    = document.getElementById(`diff-panel-${trackerId}`);
+  const panelWasOpen = diffPanel?.classList.contains('open');
+  container.innerHTML = _tcBuildHTML(t, _tcCache[trackerId]);
+  if (panelWasOpen) {
+    const newPanel = document.getElementById(`diff-panel-${trackerId}`);
+    if (newPanel) {
+      newPanel.classList.add('open');
+      const btn = container.querySelector('[onclick^="toggleDiffPanel"]');
+      if (btn) btn.textContent = 'Hide changes';
+    }
+  }
+}
+
+function _tcLoadMore(trackerId) {
+  _tcFetch(trackerId, true);
+}
+
+async function _tcDismissAll(trackerId) {
+  const cache = _tcCache[trackerId];
+  const unread = cache?.items.filter(i => !i.dismissed && !i.locked) ?? [];
+  // Optimistic update
+  unread.forEach(i => { i.dismissed = 1; });
+  _tcUpdate(trackerId);
+  try {
+    await fetch(`/api/trackers/${trackerId}/dismiss`, { method: 'POST' });
+    // SSE will update tracker.status
+  } catch {
+    // Revert
+    unread.forEach(i => { i.dismissed = 0; });
+    _tcUpdate(trackerId);
+    showSnackbar('Failed to mark changes as read', 'error');
+  }
+}
+
+async function _tcLockChange(changeId, trackerId) {
+  const cache = _tcCache[trackerId];
+  const item  = cache?.items.find(i => i.id === changeId);
+  if (!item) return;
+  const wasLocked = !!item.locked;
+  // Optimistic update
+  item.locked = wasLocked ? 0 : 1;
+  _tcUpdate(trackerId);
+  try {
+    const res = await fetch(`/api/changes/${changeId}/lock`, { method: 'POST' });
+    if (!res.ok) throw new Error();
+    const { locked } = await res.json();
+    item.locked = locked ? 1 : 0;
+    _tcUpdate(trackerId);
+  } catch {
+    // Revert optimistic update
+    item.locked = wasLocked ? 1 : 0;
+    _tcUpdate(trackerId);
+    showSnackbar('Failed to update lock', 'error');
+  }
+}
+
+async function _tcDismissChange(changeId, trackerId) {
+  const cache = _tcCache[trackerId];
+  const item  = cache?.items.find(i => i.id === changeId);
+  // Optimistic update
+  if (item) { item.dismissed = 1; _tcUpdate(trackerId); }
+  try {
+    const res = await fetch(`/api/changes/${changeId}/dismiss`, { method: 'POST' });
+    if (!res.ok) throw new Error();
+    // SSE will update tracker.status if all changes are now dismissed
+  } catch {
+    // Revert optimistic update
+    if (item) { item.dismissed = 0; _tcUpdate(trackerId); }
+    showSnackbar('Failed to mark change as read', 'error');
+  }
+}
+
+function _tcToggleHistory(id) {
+  const container = document.getElementById(`tc-history-${id}`);
+  if (!container) return;
+  const isCollapsed = _tcCollapsed.has(id);
+  if (isCollapsed) {
+    _tcCollapsed.delete(id);
+  } else {
+    _tcCollapsed.add(id);
+  }
+  // Swap the icon and re-render just the header button without a full rebuild
+  const icon = container.querySelector('.tc-toggle-btn-icon');
+  if (icon) {
+    icon.textContent = isCollapsed ? 'expand_less' : 'expand_more';
+    const btn = icon.closest('.tc-icon-btn');
+    if (btn) btn.title = isCollapsed ? 'Hide history' : 'Show history';
+  }
+  const body = container.querySelector('.tc-body');
+  if (body) {
+    if (isCollapsed) {
+      // Expanding: unhide first, then animate to full height
+      body.style.display = '';
+      body.style.maxHeight = '0';
+      body.style.overflow  = 'hidden';
+      requestAnimationFrame(() => {
+        body.style.transition = 'max-height 0.25s ease, opacity 0.2s ease';
+        body.style.opacity    = '1';
+        body.style.maxHeight  = body.scrollHeight + 'px';
+        body.addEventListener('transitionend', () => {
+          body.style.maxHeight = '';
+          body.style.overflow  = '';
+          body.style.transition = '';
+        }, { once: true });
+      });
+    } else {
+      // Collapsing: animate to zero, then hide
+      body.style.maxHeight  = body.scrollHeight + 'px';
+      body.style.overflow   = 'hidden';
+      requestAnimationFrame(() => {
+        body.style.transition = 'max-height 0.2s ease, opacity 0.15s ease';
+        body.style.maxHeight  = '0';
+        body.style.opacity    = '0';
+        body.addEventListener('transitionend', () => {
+          body.style.display    = 'none';
+          body.style.opacity    = '';
+          body.style.maxHeight  = '';
+          body.style.overflow   = '';
+          body.style.transition = '';
+        }, { once: true });
+      });
+    }
+  } else if (!isCollapsed) {
+    // Body doesn't exist yet (was collapsed on initial render) — full rebuild
+    _tcUpdate(id);
+  }
+}
+
+function _tcExpandAll() {
+  trackers.filter(t => t.changeCount > 0).forEach(t => {
+    if (_tcCollapsed.has(t.id)) _tcToggleHistory(t.id);
+  });
+}
+
+function _tcCollapseAll() {
+  trackers.filter(t => t.changeCount > 0).forEach(t => {
+    if (!_tcCollapsed.has(t.id)) _tcToggleHistory(t.id);
+  });
+}
+
+async function _tcDeleteHistory(id) {
+  const t = trackers.find(t => t.id === id);
+  if (!t) return;
+  const confirmed = await openDeleteConfirmDialog('all unlocked change history for this tracker (locked entries will be kept)', 'Delete history?');
+  if (!confirmed) return;
+  try {
+    const res = await fetch(`/api/trackers/${id}/changes`, { method: 'DELETE' });
+    if (!res.ok) throw new Error();
+    delete _tcCache[id];
+    _tcCollapsed.delete(id);
+    // SSE broadcast from server will push updated tracker (changeCount:0) → re-render
+  } catch {
+    showSnackbar('Failed to delete history', 'error');
+  }
+}
+
 // ─── DISMISS ──────────────────────────────────────────────────────────────────
 function toggleDiffPanel(id, btn) {
   const panel = document.getElementById(`diff-panel-${id}`);
@@ -1120,6 +1403,21 @@ async function dismissChange(id) {
   } catch {
     showSnackbar('Connection error', 'error');
   }
+}
+
+async function dismissAll() {
+  const changed = trackers.filter(t => t.status === 'changed');
+  if (!changed.length) return;
+  // Optimistic: mark all cached change items as dismissed immediately
+  changed.forEach(t => {
+    if (_tcCache[t.id]?.items) {
+      _tcCache[t.id].items.forEach(i => { if (!i.locked) i.dismissed = 1; });
+      _tcUpdate(t.id);
+    }
+  });
+  await Promise.all(changed.map(t =>
+    fetch(`/api/trackers/${t.id}/dismiss`, { method: 'POST' }).catch(() => {})
+  ));
 }
 
 // ─── RENDER ───────────────────────────────────────────────────────────────────
@@ -1163,7 +1461,7 @@ function renderTrackers() {
       <div class="card empty-state">
         <span class="material-icons">search_off</span>
         <h3>No trackers match</h3>
-        <p>Try a different search term or <button class="btn btn-text" style="padding:2px 6px;font-size:14px;vertical-align:baseline" onclick="document.getElementById('trackerSearch').value='';setTrackerFilter('')">clear the filter</button>.</p>
+        <p>Try a different search term or <button class="btn btn-text" style="padding:2px 6px;font-size:14px;vertical-align:baseline" onclick="clearAllFilters()">clear the filter</button>.</p>
       </div>`;
     return;
   }
@@ -1182,6 +1480,9 @@ function renderTrackers() {
     el.innerHTML = trackerHTML(t);
     list.appendChild(el);
   });
+
+  // Kick off history fetches for trackers with changes that aren't cached yet
+  filtered.filter(t => t.changeCount > 0 && !_tcCache[t.id]?.loaded).forEach(t => _tcFetch(t.id));
 
   // Restore open diff panels
   openDiffPanels.forEach(panelId => {
@@ -1209,6 +1510,22 @@ function renderTrackers() {
 }
 
 // ─── TRACKER FILTER ───────────────────────────────────────────────────────────
+function clearAllFilters() {
+  trackerFilter   = '';
+  showChangedOnly = false;
+  showActiveOnly  = false;
+  showAIOnly      = false;
+  const search = document.getElementById('trackerSearch');
+  if (search) search.value = '';
+  const changedChk = document.getElementById('showChangedOnlyChk');
+  if (changedChk) changedChk.checked = false;
+  const activeChk = document.getElementById('showActiveOnlyChk');
+  if (activeChk) activeChk.checked = false;
+  const aiChk = document.getElementById('showAIOnlyChk');
+  if (aiChk) aiChk.checked = false;
+  renderTrackers();
+}
+
 function setTrackerFilter(val) {
   trackerFilter = val.trim().toLowerCase();
   renderTrackers();
@@ -1302,6 +1619,15 @@ async function persistOrder() {
   }
 }
 
+async function moveToTop(id) {
+  const idx = trackers.findIndex(t => t.id === id);
+  if (idx <= 0) return;
+  const [moved] = trackers.splice(idx, 1);
+  trackers.unshift(moved);
+  renderTrackers();
+  await persistOrder();
+}
+
 function trackerHTML(t) {
   const statusClass = !t.active             ? 'status-pending' :
                       t.status === 'checking' ? 'status-pending' :
@@ -1325,26 +1651,16 @@ function trackerHTML(t) {
   const intervalLabel = intervalText(t.interval);
 
   let changeBanner = '';
-  if ((t.status === 'changed' || t.status === 'error') && t.changeSummary) {
-    const hasSnippet = t.status === 'changed' && t.changeSnippet;
+  if (t.status === 'error' && t.changeSummary) {
+    // Error: keep the simple single-banner style
     changeBanner = `
       <div class="tracker-change-banner">
-        <span class="material-icons">${t.status === 'error' ? 'error_outline' : 'info_outline'}</span>
-        <span class="diff-summary">${escHtml(t.changeSummary)}</span>
-        ${hasSnippet ? `<button class="btn btn-text" style="padding:4px 10px;font-size:12px;white-space:nowrap" onclick="toggleDiffPanel('${t.id}',this)">Show changes</button>` : ''}
-        ${t.status === 'changed' ? `<button class="btn btn-text" style="padding:4px 10px;font-size:12px" onclick="dismissChange('${t.id}')">Dismiss</button>` : ''}
-      </div>
-      ${hasSnippet ? `
-      <div class="diff-panel" id="diff-panel-${t.id}">
-        <div class="diff-panel-inner">
-          <div class="diff-block diff-removed">
-            <div class="diff-block-label">Before</div>${escHtml(t.changeSnippet.removed)}
-          </div>
-          <div class="diff-block diff-added">
-            <div class="diff-block-label">After</div>${escHtml(t.changeSnippet.added)}
-          </div>
-        </div>
-      </div>` : ''}`;
+        <span class="material-icons">error_outline</span>
+        <span class="diff-summary">${renderSummary(t.changeSummary)}</span>
+      </div>`;
+  } else if (t.changeCount > 0) {
+    // Change history stacking panel
+    changeBanner = `<div id="tc-history-${t.id}" class="tc-history">${_tcBuildHTML(t, _tcCache[t.id])}</div>`;
   }
 
   return `
@@ -1369,10 +1685,11 @@ function trackerHTML(t) {
           <input type="checkbox" ${t.active ? 'checked' : ''} onchange="toggleTracker('${t.id}')">
           <span class="toggle-slider"></span>
         </label>
-        <a class="btn-icon material-icons" href="${escHtml(t.url)}" target="_blank" rel="noopener noreferrer" title="Open URL in new tab" style="text-decoration:none">open_in_new</a>
-        <button class="btn-icon material-icons" onclick="toggleEdit('${t.id}')" title="Edit">edit</button>
-        <button class="btn-icon material-icons" onclick="checkTracker('${t.id}')" title="Check now" ${t.status === 'checking' ? 'disabled' : ''}>refresh</button>
-        <button class="btn-icon material-icons" style="color:var(--error)" onclick="removeTracker('${t.id}')" title="Remove">delete_outline</button>
+        <button class="btn-icon tracker-action-icon" onclick="moveToTop('${t.id}')" title="Move to top" ${trackers[0]?.id === t.id ? 'disabled style="opacity:0.25;cursor:default"' : ''}><span class="material-icons">vertical_align_top</span></button>
+        <a class="btn-icon tracker-action-icon material-icons" href="${escHtml(t.url)}" target="_blank" rel="noopener noreferrer" title="Open URL in new tab" style="text-decoration:none">open_in_new</a>
+        <button class="btn-icon tracker-action-icon material-icons" onclick="toggleEdit('${t.id}')" title="Edit">edit</button>
+        <button class="btn-icon tracker-action-icon material-icons" onclick="checkTracker('${t.id}')" title="Check now" ${t.status === 'checking' ? 'disabled' : ''}>refresh</button>
+        <button class="btn-icon tracker-action-icon material-icons" style="color:var(--error)" onclick="removeTracker('${t.id}')" title="Remove">delete_outline</button>
       </div>
     </div>
     ${editingId === t.id ? `
@@ -1414,6 +1731,13 @@ function trackerHTML(t) {
 function updateBadge() {
   const active = trackers.filter(t => t.active).length;
   document.getElementById('activeCount').textContent = `${active} active`;
+  const btn = document.getElementById('dismissAllBtn');
+  if (btn) btn.style.display = trackers.some(t => t.status === 'changed') ? '' : 'none';
+  const hasHistory = trackers.some(t => t.changeCount > 0);
+  const expandBtn   = document.getElementById('expandAllBtn');
+  const collapseBtn = document.getElementById('collapseAllBtn');
+  if (expandBtn)   expandBtn.style.display   = hasHistory ? '' : 'none';
+  if (collapseBtn) collapseBtn.style.display = hasHistory ? '' : 'none';
 }
 
 // ─── NOTIFICATIONS ────────────────────────────────────────────────────────────
@@ -1439,8 +1763,16 @@ function triggerBrowserNotification(label, url) {
 
 // ─── AI RESOURCE FINDER ───────────────────────────────────────────────────────
 let aiSuggestions        = [];
+let aiVisibleCount       = 10;
+let aiCategoryFilter     = null;
+const AI_PAGE_SIZE       = 10;
 let _trackerOptResolver  = null;
 let _trackerOptEscHandler = null;
+
+// Per-tracker change history cache: trackerId → { items, total, loaded, loading }
+const _tcCache = {};
+// Trackers whose history panel is collapsed
+const _tcCollapsed = new Set();
 
 const AI_CATEGORY_CLASS = {
   'News':     'ai-cat-news',
@@ -1452,6 +1784,32 @@ const AI_CATEGORY_CLASS = {
   'Video':    'ai-cat-video',
   'Other':    'ai-cat-other',
 };
+
+function clearAIResults() {
+  aiSuggestions    = [];
+  aiVisibleCount   = AI_PAGE_SIZE;
+  aiCategoryFilter = null;
+  document.getElementById('aiResultsPanel').style.display = 'none';
+  document.getElementById('aiSearchInput').value = '';
+  document.getElementById('aiSearchInput').focus();
+}
+
+async function prefillLabelFromUrl(url) {
+  if (!url) return;
+  try { new URL(url); } catch { return; }
+  const labelEl = document.getElementById('labelInput');
+  // Don't overwrite if the user already typed something
+  if (labelEl.value.trim()) return;
+  try {
+    const res  = await fetch(`/api/fetch-title?url=${encodeURIComponent(url)}`);
+    if (!res.ok) return;
+    const { title } = await res.json();
+    if (title && !labelEl.value.trim()) {
+      labelEl.value = title.slice(0, 120);
+      labelEl.select();
+    }
+  } catch { /* silent — label stays empty */ }
+}
 
 async function searchAIResources() {
   const query = document.getElementById('aiSearchInput').value.trim();
@@ -1482,7 +1840,9 @@ async function searchAIResources() {
       panel.style.display = 'none';
       return;
     }
-    aiSuggestions = (data.suggestions || []).map(s => ({ ...s, selected: false }));
+  aiSuggestions    = (data.suggestions || []).map(s => ({ ...s, selected: false }));
+    aiVisibleCount   = AI_PAGE_SIZE;
+    aiCategoryFilter = null;
     _renderAISuggestions(query);
   } catch {
     showSnackbar('Connection error', 'error');
@@ -1491,6 +1851,34 @@ async function searchAIResources() {
     btn.disabled = false;
     btn.innerHTML = '<span class="material-icons" style="font-size:18px">auto_awesome</span> Find Resources';
   }
+}
+
+function _aiSetCategoryFilter(cat) {
+  aiCategoryFilter = (aiCategoryFilter === cat) ? null : cat;
+  aiVisibleCount   = AI_PAGE_SIZE;
+  const query = document.getElementById('aiSearchInput').value.trim();
+  _renderAISuggestions(query);
+}
+
+function _renderCategoryFilterChips() {
+  const filtersEl = document.getElementById('aiCategoryFilters');
+  if (!filtersEl) return;
+
+  // Count each category across ALL suggestions (not just visible)
+  const counts = {};
+  aiSuggestions.forEach(s => { counts[s.category] = (counts[s.category] || 0) + 1; });
+  const cats = Object.keys(counts).sort();
+
+  if (cats.length <= 1) { filtersEl.style.display = 'none'; return; }
+
+  filtersEl.style.display = 'flex';
+  filtersEl.innerHTML = cats.map(cat => {
+    const cls     = AI_CATEGORY_CLASS[cat] || 'ai-cat-other';
+    const active  = aiCategoryFilter === cat;
+    return `<button class="ai-filter-chip ${cls}${active ? ' active' : ''}" onclick="_aiSetCategoryFilter('${escHtml(cat)}')">
+      ${escHtml(cat)} <span class="ai-filter-chip-count">${counts[cat]}</span>
+    </button>`;
+  }).join('');
 }
 
 function _renderAISuggestions(query) {
@@ -1503,14 +1891,23 @@ function _renderAISuggestions(query) {
     return;
   }
 
-  title.textContent = `${aiSuggestions.length} suggestion${aiSuggestions.length !== 1 ? 's' : ''} for "${escHtml(query)}"`;
+  _renderCategoryFilterChips();
 
-  list.innerHTML = aiSuggestions.map((s, i) => {
+  const filtered  = aiCategoryFilter ? aiSuggestions.filter(s => s.category === aiCategoryFilter) : aiSuggestions;
+  const shown     = filtered.slice(0, aiVisibleCount);
+  const remaining = filtered.length - aiVisibleCount;
+  const totalDesc = aiCategoryFilter
+    ? `${filtered.length} ${aiCategoryFilter} result${filtered.length !== 1 ? 's' : ''} of ${aiSuggestions.length} total`
+    : `${aiSuggestions.length} suggestion${aiSuggestions.length !== 1 ? 's' : ''}`;
+  title.textContent = `Showing ${shown.length} of ${totalDesc} for "${escHtml(query)}"`;
+
+  const itemsHtml = shown.map((s) => {
+    const origIdx  = aiSuggestions.indexOf(s);
     const catClass = AI_CATEGORY_CLASS[s.category] || 'ai-cat-other';
     return `
-    <div class="ai-suggestion-item${s.selected ? ' selected' : ''}" data-ai-idx="${i}" onclick="_aiToggle(${i})">
+    <div class="ai-suggestion-item${s.selected ? ' selected' : ''}" data-ai-idx="${origIdx}" onclick="_aiToggle(${origIdx})">
       <input type="checkbox" class="ai-suggestion-checkbox" ${s.selected ? 'checked' : ''}
-        onclick="event.stopPropagation();_aiToggle(${i})" />
+        onclick="event.stopPropagation();_aiToggle(${origIdx})" />
       <div class="ai-suggestion-body">
         <div class="ai-suggestion-label">${escHtml(s.label)}</div>
         <a class="ai-suggestion-url" href="${escHtml(s.url)}" target="_blank" rel="noopener noreferrer"
@@ -1521,7 +1918,24 @@ function _renderAISuggestions(query) {
     </div>`;
   }).join('');
 
+  const showMoreHtml = remaining > 0
+    ? `<div class="ai-show-more">
+        <button class="btn btn-text" onclick="_aiShowMore()">
+          <span class="material-icons" style="font-size:18px">expand_more</span>
+          Show ${Math.min(remaining, AI_PAGE_SIZE)} more <span style="color:var(--on-surface-light);font-weight:400">(${remaining} remaining)</span>
+        </button>
+       </div>`
+    : '';
+
+  list.innerHTML = itemsHtml + showMoreHtml;
   _updateAIAddBtn();
+}
+
+function _aiShowMore() {
+  const filtered = aiCategoryFilter ? aiSuggestions.filter(s => s.category === aiCategoryFilter) : aiSuggestions;
+  aiVisibleCount = Math.min(aiVisibleCount + AI_PAGE_SIZE, filtered.length);
+  const query = document.getElementById('aiSearchInput').value.trim();
+  _renderAISuggestions(query);
 }
 
 function _aiToggle(index) {
@@ -1537,7 +1951,9 @@ function _aiToggle(index) {
 }
 
 function aiSelectAll(selected) {
-  aiSuggestions.forEach(s => s.selected = selected);
+  // Only affect currently visible (and filtered) items
+  const filtered = aiCategoryFilter ? aiSuggestions.filter(s => s.category === aiCategoryFilter) : aiSuggestions;
+  filtered.slice(0, aiVisibleCount).forEach(s => s.selected = selected);
   document.querySelectorAll('.ai-suggestion-item').forEach(item => {
     item.classList.toggle('selected', selected);
     const cb = item.querySelector('.ai-suggestion-checkbox');
@@ -1682,6 +2098,39 @@ function escHtml(str) {
   return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+// Render AI summary text: supports markdown bullets (- / * / •), bold (**text**), and newlines
+function renderSummary(text) {
+  if (!text) return '';
+  const lines = text.split(/\n/);
+  let html = '';
+  let inList = false;
+
+  for (let raw of lines) {
+    const line = raw.trim();
+    if (!line) {
+      if (inList) { html += '</ul>'; inList = false; }
+      html += '<br>';
+      continue;
+    }
+    const bulletMatch = line.match(/^[-*•]\s+(.*)/);
+    if (bulletMatch) {
+      if (!inList) { html += '<ul class="summary-list">'; inList = true; }
+      html += `<li>${_summaryInline(bulletMatch[1])}</li>`;
+    } else {
+      if (inList) { html += '</ul>'; inList = false; }
+      html += `<p class="summary-para">${_summaryInline(line)}</p>`;
+    }
+  }
+  if (inList) html += '</ul>';
+  return html;
+}
+
+function _summaryInline(str) {
+  return escHtml(str)
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g, '<em>$1</em>');
+}
+
 // ─── CONFIRM MODAL ────────────────────────────────────────────────────────────
 function openDeleteConfirmDialog(label, title) {
   const modal     = document.getElementById('confirmModal');
@@ -1745,3 +2194,17 @@ document.addEventListener('keydown', (e) => {
 
 // ─── BOOT ─────────────────────────────────────────────────────────────────────
 init();
+
+// ─── STICKY TOOLBAR SENTINEL ──────────────────────────────────────────────────
+// Add .is-stuck when the section header is scrolled into sticky position.
+// Uses an IntersectionObserver on a zero-height sentinel inserted just above it.
+(function initStickyToolbar() {
+  const header = document.querySelector('.section-header');
+  if (!header || !window.IntersectionObserver) return;
+  const sentinel = document.createElement('div');
+  sentinel.style.cssText = 'height:1px;pointer-events:none;margin-bottom:-1px';
+  header.parentNode.insertBefore(sentinel, header);
+  new IntersectionObserver(([entry]) => {
+    header.classList.toggle('is-stuck', !entry.isIntersecting);
+  }, { threshold: 0, rootMargin: `-${65}px 0px 0px 0px` }).observe(sentinel);
+})();

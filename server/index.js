@@ -92,6 +92,20 @@ db.exec(`
   );
 `);
 
+// Migrations for existing DBs
+try { db.prepare('ALTER TABLE changes ADD COLUMN dismissed INTEGER DEFAULT 0').run(); } catch {}
+try { db.prepare('ALTER TABLE changes ADD COLUMN locked   INTEGER DEFAULT 0').run(); } catch {}
+
+// Indexes for query performance — idempotent, safe to run on every startup
+db.exec(`
+  CREATE INDEX IF NOT EXISTS idx_changes_trackerId  ON changes(trackerId);
+  CREATE INDEX IF NOT EXISTS idx_changes_detectedAt ON changes(detectedAt);
+  CREATE INDEX IF NOT EXISTS idx_trackers_userId    ON trackers(userId);
+`);
+
+// Pre-compiled statements used in hot paths (parsed once, reused on every call)
+const _selectUserForAuth = db.prepare('SELECT id, role, disabled FROM users WHERE id = ?');
+
 function rowToTracker(row) {
   return {
     ...row,
@@ -111,18 +125,6 @@ function loadChanges() {
 
 function loadUsers() {
   return db.prepare('SELECT * FROM users').all();
-}
-
-function saveUsers(users) {
-  const upsert = db.prepare(`
-    INSERT INTO users (id, username, passwordHash, createdAt, email)
-    VALUES (@id, @username, @passwordHash, @createdAt, @email)
-    ON CONFLICT(id) DO UPDATE SET
-      username=excluded.username,
-      passwordHash=excluded.passwordHash,
-      email=excluded.email
-  `);
-  db.transaction(() => users.forEach(u => upsert.run({ email: null, ...u })))();
 }
 
 const _upsertTracker = db.prepare(`
@@ -145,6 +147,22 @@ const _upsertTracker = db.prepare(`
 
 function saveTrackers(list) {
   const incomingIds = list.map(t => t.id);
+  const incomingUserIds = new Set(list.map(t => t.userId).filter(Boolean));
+
+  // Identify users who will have ALL their trackers removed so we can broadcast
+  // an empty list to any open tabs they have — without this they'd see stale data.
+  let emptyUserIds = [];
+  if (incomingIds.length > 0) {
+    const ph = incomingIds.map(() => '?').join(',');
+    emptyUserIds = db.prepare(
+      `SELECT DISTINCT userId FROM trackers WHERE id NOT IN (${ph})`
+    ).all(...incomingIds)
+      .map(r => r.userId)
+      .filter(uid => uid && !incomingUserIds.has(uid));
+  } else {
+    emptyUserIds = db.prepare('SELECT DISTINCT userId FROM trackers').all().map(r => r.userId);
+  }
+
   db.transaction(() => {
     list.forEach((t, i) => {
       _upsertTracker.run({
@@ -158,8 +176,10 @@ function saveTrackers(list) {
     // Remove DB rows no longer present in the in-memory list
     if (incomingIds.length > 0) {
       const placeholders = incomingIds.map(() => '?').join(',');
+      db.prepare(`DELETE FROM changes WHERE trackerId NOT IN (${placeholders})`).run(...incomingIds);
       db.prepare(`DELETE FROM trackers WHERE id NOT IN (${placeholders})`).run(...incomingIds);
     } else {
+      db.prepare('DELETE FROM changes').run();
       db.prepare('DELETE FROM trackers').run();
     }
   })();
@@ -175,6 +195,26 @@ function saveTrackers(list) {
     const safe = userTrackers.map(({ lastBody, ...rest }) => rest);
     broadcastToUser({ type: 'update', trackers: safe }, userId);
   });
+  // Notify users who lost all their trackers (clears stale tracker lists in other tabs)
+  emptyUserIds.forEach(uid => broadcastToUser({ type: 'update', trackers: [] }, uid));
+}
+
+// Lightweight single-tracker save used during check cycles.
+// Upserts only one row and broadcasts only to that user — avoids re-writing
+// every tracker and running orphan-cleanup queries on each check.
+function _saveOneTracker(tracker) {
+  _upsertTracker.run({
+    ...tracker,
+    active:        tracker.active       ? 1 : 0,
+    aiSummary:     tracker.aiSummary === false ? 0 : 1,
+    changeSnippet: tracker.changeSnippet ? JSON.stringify(tracker.changeSnippet) : null,
+    position:      trackers.indexOf(tracker),
+  });
+  const userTrackers = trackers.filter(t => t.userId === tracker.userId);
+  broadcastToUser(
+    { type: 'update', trackers: userTrackers.map(({ lastBody, ...rest }) => rest) },
+    tracker.userId
+  );
 }
 
 function saveChange(change) {
@@ -182,12 +222,16 @@ function saveChange(change) {
     INSERT INTO changes (id, trackerId, trackerLabel, url, detectedAt, summary, oldHash, newHash)
     VALUES (@id, @trackerId, @trackerLabel, @url, @detectedAt, @summary, @oldHash, @newHash)
   `).run(change);
-  // Keep only the most recent 500 change records
-  db.prepare(`
-    DELETE FROM changes WHERE id NOT IN (
-      SELECT id FROM changes ORDER BY detectedAt DESC LIMIT 500
-    )
-  `).run();
+  // Only prune when the unlocked pool actually exceeds the cap — avoids a
+  // redundant DELETE subquery scan on every save when well under the limit.
+  const { c } = db.prepare('SELECT COUNT(*) as c FROM changes WHERE locked = 0').get();
+  if (c > 500) {
+    db.prepare(`
+      DELETE FROM changes WHERE locked = 0 AND id NOT IN (
+        SELECT id FROM changes WHERE locked = 0 ORDER BY detectedAt DESC LIMIT 500
+      )
+    `).run();
+  }
 }
 
 let trackers = loadTrackers();
@@ -289,10 +333,25 @@ async function getChangeSummary(oldText, newText, url) {
       'https://api.anthropic.com/v1/messages',
       {
         model:      'claude-sonnet-4-20250514',
-        max_tokens: 300,
+        max_tokens: 500,
         messages: [{
           role:    'user',
-          content: `You are a concise change-detection assistant. Compare these two snapshots of webpage content and describe what meaningfully changed in 1-2 plain English sentences.\n\nFocus on: headings, article titles, main content sections, featured items, key announcements.\nIgnore: timestamps, dates, comment counts, view counts, vote counts, reaction counts, "X minutes ago" style text, and other dynamic counters.\nDo not mention HTML or formatting markup.\n\nURL: ${url}\n\n--- BEFORE ---\n${oldText.slice(0, 2500)}\n\n--- AFTER ---\n${newText.slice(0, 2500)}`
+          content: `You are an expert at interpreting web content changes and explaining their real-world significance.
+
+Compare the two snapshots below and write 2-3 plain English sentences describing what actually changed and why it matters.
+
+Prioritise: new stories or announcements, shifts in narrative or stance, newly featured or removed content, changes to key facts, prices, statuses, or decisions.
+Ignore entirely: timestamps, relative dates ("X minutes ago"), view/comment/vote/reaction counts, ads, navigation links, and any other dynamic boilerplate.
+Do not describe HTML structure, formatting, or page layout.
+Write as if briefing someone who cares about this topic — focus on the substance and implications of the change, not just what words appeared or disappeared.\nWhen there are multiple distinct changes, prefer a short bulleted list over a single dense paragraph. Use plain markdown only: bullet points with "- ", bold with **text**, and blank lines between sections. Do not use headers or nested lists.
+
+URL: ${url}
+
+--- BEFORE ---
+${oldText.slice(0, 3000)}
+
+--- AFTER ---
+${newText.slice(0, 3000)}`
         }]
       },
       {
@@ -368,7 +427,7 @@ async function checkTracker(tracker) {
 
       let summary;
       if (tracker.aiSummary === false) {
-        summary = 'Content changed (AI summary disabled for this resource).';
+        summary = 'Content changed.';
       } else {
         summary = await getChangeSummary(tracker.lastBody, structuredText, tracker.url);
       }
@@ -405,19 +464,49 @@ async function checkTracker(tracker) {
     log('✗', _c.red, `Error     "${tracker.label}"  — ${err.message}`);
   }
 
-  saveTrackers(trackers);
+  _saveOneTracker(tracker);
   return tracker;
 }
 
 // ─── SCHEDULER ────────────────────────────────────────────────────────────────
 const activeTimers = {};
 
+// Concurrency queue — prevents thundering herd when many trackers share the
+// same interval. At most CHECK_CONCURRENCY checks run in parallel; any timer
+// that fires for a tracker already in-flight is silently dropped.
+const CHECK_CONCURRENCY = parseInt(process.env.CHECK_CONCURRENCY) || 5;
+let   _queueRunning = 0;
+const _checkQueue   = [];  // ordered list of tracker IDs waiting to run
+const _inFlight     = new Set(); // IDs currently inside checkTracker
+
+function enqueueCheck(tracker) {
+  if (_inFlight.has(tracker.id)) return;  // already running — drop duplicate
+  _checkQueue.push(tracker.id);
+  _drainCheckQueue();
+}
+
+function _drainCheckQueue() {
+  while (_queueRunning < CHECK_CONCURRENCY && _checkQueue.length > 0) {
+    const id = _checkQueue.shift();
+    if (_inFlight.has(id)) continue;   // queued twice — skip
+    const t = trackers.find(t => t.id === id);
+    if (!t || !t.active) continue;     // removed or paused while waiting
+    _inFlight.add(id);
+    _queueRunning++;
+    checkTracker(t).finally(() => {
+      _inFlight.delete(id);
+      _queueRunning--;
+      _drainCheckQueue();
+    });
+  }
+}
+
 function startTrackerTimer(tracker) {
   stopTrackerTimer(tracker.id);
   if (!tracker.active) return;
-  activeTimers[tracker.id] = setInterval(async () => {
+  activeTimers[tracker.id] = setInterval(() => {
     const t = trackers.find(t => t.id === tracker.id);
-    if (t && t.active) await checkTracker(t);
+    if (t && t.active) enqueueCheck(t);
   }, tracker.interval);
   log('⏱', _c.blue, `Scheduled "${tracker.label}" every ${tracker.interval / 1000}s`);
 }
@@ -466,7 +555,7 @@ function authMiddleware(req, res, next) {
   if (!token) return res.status(401).json({ error: 'Not authenticated' });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const user = db.prepare('SELECT id, role, disabled FROM users WHERE id = ?').get(payload.userId);
+    const user = _selectUserForAuth.get(payload.userId);
     if (!user) {
       res.clearCookie('watchbot_auth');
       return res.status(401).json({ error: 'Account no longer exists' });
@@ -576,9 +665,11 @@ app.delete('/api/auth/profile', authMiddleware, async (req, res) => {
 
   trackers.filter(t => t.userId === req.userId).forEach(t => stopTrackerTimer(t.id));
   trackers = trackers.filter(t => t.userId !== req.userId);
-  db.prepare('DELETE FROM changes WHERE trackerId IN (SELECT id FROM trackers WHERE userId = ?)').run(req.userId);
-  db.prepare('DELETE FROM trackers WHERE userId = ?').run(req.userId);
-  db.prepare('DELETE FROM users WHERE id = ?').run(req.userId);
+  db.transaction(() => {
+    db.prepare('DELETE FROM changes WHERE trackerId IN (SELECT id FROM trackers WHERE userId = ?)').run(req.userId);
+    db.prepare('DELETE FROM trackers WHERE userId = ?').run(req.userId);
+    db.prepare('DELETE FROM users WHERE id = ?').run(req.userId);
+  })();
   res.clearCookie('watchbot_auth');
   res.json({ success: true });
 });
@@ -711,9 +802,11 @@ app.delete('/api/admin/users/:id', adminMiddleware, (req, res) => {
   // Stop & remove all their trackers
   trackers.filter(t => t.userId === targetId).forEach(t => stopTrackerTimer(t.id));
   trackers = trackers.filter(t => t.userId !== targetId);
-  db.prepare('DELETE FROM changes WHERE trackerId IN (SELECT id FROM trackers WHERE userId = ?)').run(targetId);
-  db.prepare('DELETE FROM trackers WHERE userId = ?').run(targetId);
-  db.prepare('DELETE FROM users WHERE id = ?').run(targetId);
+  db.transaction(() => {
+    db.prepare('DELETE FROM changes WHERE trackerId IN (SELECT id FROM trackers WHERE userId = ?)').run(targetId);
+    db.prepare('DELETE FROM trackers WHERE userId = ?').run(targetId);
+    db.prepare('DELETE FROM users WHERE id = ?').run(targetId);
+  })();
 
   // Force-logout any active SSE sessions for the deleted user
   const forceLogout = `data: ${JSON.stringify({ type: 'force_logout' })}\n\n`;
@@ -747,6 +840,7 @@ app.delete('/api/admin/trackers/:id', adminMiddleware, (req, res) => {
   const tracker = trackers.find(t => t.id === req.params.id);
   if (!tracker) return res.status(404).json({ error: 'Not found' });
   stopTrackerTimer(tracker.id);
+  db.prepare('DELETE FROM changes WHERE trackerId = ?').run(tracker.id);
   trackers = trackers.filter(t => t.id !== tracker.id);
   saveTrackers(trackers);
   res.json({ success: true });
@@ -792,6 +886,47 @@ app.post('/api/admin/stop-impersonate', (req, res) => {
     notificationsEnabled: user?.notificationsEnabled !== 0 });
 });
 
+// ─── FETCH PAGE TITLE ────────────────────────────────────────────────────────
+function decodeHtmlEntities(str) {
+  return str
+    .replace(/&amp;/gi,    '&')
+    .replace(/&lt;/gi,     '<')
+    .replace(/&gt;/gi,     '>')
+    .replace(/&quot;/gi,   '"')
+    .replace(/&apos;/gi,   "'")
+    .replace(/&nbsp;/gi,   ' ')
+    .replace(/&ndash;/gi,  '–')
+    .replace(/&mdash;/gi,  '—')
+    .replace(/&lsquo;/gi,  '\u2018')
+    .replace(/&rsquo;/gi,  '\u2019')
+    .replace(/&ldquo;/gi,  '\u201c')
+    .replace(/&rdquo;/gi,  '\u201d')
+    .replace(/&hellip;/gi, '…')
+    .replace(/&trade;/gi,  '™')
+    .replace(/&copy;/gi,   '©')
+    .replace(/&reg;/gi,    '®')
+    // Decimal numeric entities e.g. &#8211; &#039;
+    .replace(/&#(\d+);/g,         (_, n) => String.fromCodePoint(parseInt(n, 10)))
+    // Hex numeric entities e.g. &#x2019;
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)));
+}
+
+app.get('/api/fetch-title', authMiddleware, async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).json({ error: 'url is required' });
+  try { new URL(url); } catch { return res.status(400).json({ error: 'Invalid URL' }); }
+  try {
+    const { body } = await fetchResource(url);
+    const match = body.match(/<title[^>]*>([\s\S]{1,400}?)<\/title>/i);
+    const title = match
+      ? decodeHtmlEntities(match[1].replace(/\s+/g, ' ').trim())
+      : null;
+    res.json({ title });
+  } catch (err) {
+    res.json({ title: null });
+  }
+});
+
 // ─── AI RESOURCE FINDER ───────────────────────────────────────────────────────
 app.post('/api/ai/find-resources', authMiddleware, async (req, res) => {
   const { query } = req.body;
@@ -805,10 +940,10 @@ app.post('/api/ai/find-resources', authMiddleware, async (req, res) => {
       'https://api.anthropic.com/v1/messages',
       {
         model: 'claude-sonnet-4-20250514',
-        max_tokens: 2048,
+        max_tokens: 8192,
         messages: [{
           role: 'user',
-          content: `You are a web resource discovery assistant. Given a topic the user wants to monitor for updates, suggest 20 to 50 real, high-quality, publicly accessible URLs that would give meaningful, ongoing updates about that topic.
+          content: `You are a web resource discovery assistant. Given a topic the user wants to monitor for updates, suggest exactly 30 real, high-quality, publicly accessible URLs that would give meaningful, ongoing updates about that topic.
 
 Topic: "${query.trim().slice(0, 200)}"
 
@@ -826,7 +961,7 @@ Prioritise:
 - Real-time data feeds or JSON/RSS endpoints
 - High-signal social or community sources
 
-Return 20–50 results. Return only the JSON array, no other text.`
+Return exactly 30 results. Return only the JSON array, no other text.`
         }]
       },
       {
@@ -835,16 +970,32 @@ Return 20–50 results. Return only the JSON array, no other text.`
           'anthropic-version': '2023-06-01',
           'content-type':      'application/json'
         },
-        timeout: 30000
+        timeout: 90000
       }
     );
 
-    const text = response.data?.content?.[0]?.text || '[]';
-    const jsonMatch = text.match(/\[[\s\S]*\]/);
-    if (!jsonMatch) return res.status(500).json({ error: 'AI returned an unexpected format' });
+    const rawText = response.data?.content?.[0]?.text || '';
+    if (!rawText) return res.status(500).json({ error: 'AI returned an empty response' });
+
+    // Strip any markdown code fences Claude may have added despite instructions
+    const cleaned = rawText.replace(/```(?:json)?\s*/gi, '').replace(/```\s*/g, '').trim();
+
+    // Find the outermost JSON array — use indexOf/lastIndexOf instead of a
+    // greedy regex so that stray brackets in any preamble text don't corrupt the slice
+    const arrayStart = cleaned.indexOf('[');
+    const arrayEnd   = cleaned.lastIndexOf(']');
+    if (arrayStart === -1 || arrayEnd === -1 || arrayEnd <= arrayStart) {
+      log('✗', _c.red, `AI finder: no JSON array found. Response preview: ${rawText.slice(0, 400)}`);
+      return res.status(500).json({ error: 'AI returned an unexpected format' });
+    }
 
     let raw;
-    try { raw = JSON.parse(jsonMatch[0]); } catch { return res.status(500).json({ error: 'AI response could not be parsed' }); }
+    try {
+      raw = JSON.parse(cleaned.slice(arrayStart, arrayEnd + 1));
+    } catch (parseErr) {
+      log('✗', _c.red, `AI finder: JSON parse failed (${parseErr.message}). Preview: ${cleaned.slice(arrayStart, arrayStart + 400)}`);
+      return res.status(500).json({ error: 'AI response could not be parsed' });
+    }
     if (!Array.isArray(raw)) return res.status(500).json({ error: 'AI response was not an array' });
 
     const allowed = new Set(['News', 'Official', 'Social', 'Data/API', 'Blog', 'Forum', 'Video', 'Other']);
@@ -859,7 +1010,7 @@ Return 20–50 results. Return only the JSON array, no other text.`
         description: String(s.description || '').slice(0, 300),
         category:    allowed.has(s.category) ? s.category : 'Other'
       }))
-      .slice(0, 50);
+      .slice(0, 30);
 
     log('✦', _c.magenta, `AI finder  "${query.trim()}"  → ${suggestions.length} suggestions`);
     res.json({ suggestions, query: query.trim() });
@@ -917,7 +1068,7 @@ app.post('/api/trackers', authMiddleware, async (req, res) => {
   trackers.unshift(tracker);
   saveTrackers(trackers);
   startTrackerTimer(tracker);
-  checkTracker(tracker); // fire-and-forget first check
+  enqueueCheck(tracker); // queue first check — respects concurrency limit
 
   const { lastBody, ...safe } = tracker;
   res.status(201).json(safe);
@@ -951,6 +1102,7 @@ app.delete('/api/trackers/:id', authMiddleware, (req, res) => {
   const tracker = trackers.find(t => t.id === req.params.id && t.userId === req.userId);
   if (!tracker) return res.status(404).json({ error: 'Not found' });
   stopTrackerTimer(req.params.id);
+  db.prepare('DELETE FROM changes WHERE trackerId = ?').run(req.params.id);
   trackers = trackers.filter(t => t.id !== req.params.id);
   saveTrackers(trackers);
   res.json({ success: true });
@@ -980,6 +1132,7 @@ app.post('/api/trackers/:id/check', authMiddleware, async (req, res) => {
 app.post('/api/trackers/:id/dismiss', authMiddleware, (req, res) => {
   const tracker = trackers.find(t => t.id === req.params.id && t.userId === req.userId);
   if (!tracker) return res.status(404).json({ error: 'Not found' });
+  db.prepare('UPDATE changes SET dismissed = 1 WHERE trackerId = ? AND locked = 0').run(req.params.id);
   tracker.status        = 'ok';
   tracker.changeSummary = null;
   tracker.changeSnippet = null;
@@ -987,14 +1140,79 @@ app.post('/api/trackers/:id/dismiss', authMiddleware, (req, res) => {
   res.json({ success: true });
 });
 
+app.post('/api/changes/:id/dismiss', authMiddleware, (req, res) => {
+  const change = db.prepare('SELECT trackerId, locked FROM changes WHERE id = ?').get(req.params.id);
+  if (!change) return res.status(404).json({ error: 'Not found' });
+  const tracker = trackers.find(t => t.id === change.trackerId && t.userId === req.userId);
+  if (!tracker) return res.status(403).json({ error: 'Forbidden' });
+  if (change.locked) return res.status(409).json({ error: 'Change is locked' });
+  db.prepare('UPDATE changes SET dismissed = 1 WHERE id = ?').run(req.params.id);
+  // Reset tracker status when no undismissed changes remain
+  const undismissed = db.prepare('SELECT COUNT(*) as c FROM changes WHERE trackerId = ? AND dismissed = 0').get(tracker.id).c;
+  if (undismissed === 0) {
+    tracker.status        = 'ok';
+    tracker.changeSummary = null;
+    tracker.changeSnippet = null;
+    saveTrackers(trackers);
+  }
+  res.json({ success: true });
+});
+
+app.post('/api/changes/:id/lock', authMiddleware, (req, res) => {
+  const change = db.prepare('SELECT trackerId, locked FROM changes WHERE id = ?').get(req.params.id);
+  if (!change) return res.status(404).json({ error: 'Not found' });
+  const tracker = trackers.find(t => t.id === change.trackerId && t.userId === req.userId);
+  if (!tracker) return res.status(403).json({ error: 'Forbidden' });
+  const newLocked = change.locked ? 0 : 1;
+  db.prepare('UPDATE changes SET locked = ? WHERE id = ?').run(newLocked, req.params.id);
+  res.json({ locked: newLocked === 1 });
+});
+
 app.get('/api/changes', authMiddleware, (req, res) => {
-  const limit     = parseInt(req.query.limit) || 50;
-  const trackerId = req.query.trackerId;
-  // Only return changes for trackers owned by the requesting user
-  const userTrackerIds = new Set(trackers.filter(t => t.userId === req.userId).map(t => t.id));
-  let changes = loadChanges().filter(c => userTrackerIds.has(c.trackerId));
-  if (trackerId) changes = changes.filter(c => c.trackerId === trackerId);
-  res.json(changes.slice(0, limit));
+  const limit          = Math.min(parseInt(req.query.limit) || 50, 200);
+  const trackerId      = req.query.trackerId;
+  const userTrackerIds = trackers.filter(t => t.userId === req.userId).map(t => t.id);
+  if (userTrackerIds.length === 0) return res.json([]);
+  // Push ownership filtering and LIMIT into SQL — avoids loading the whole table
+  if (trackerId) {
+    if (!userTrackerIds.includes(trackerId)) return res.json([]);
+    return res.json(db.prepare(
+      'SELECT * FROM changes WHERE trackerId = ? ORDER BY detectedAt DESC LIMIT ?'
+    ).all(trackerId, limit));
+  }
+  const ph = userTrackerIds.map(() => '?').join(',');
+  res.json(db.prepare(
+    `SELECT * FROM changes WHERE trackerId IN (${ph}) ORDER BY detectedAt DESC LIMIT ?`
+  ).all(...userTrackerIds, limit));
+});
+
+app.get('/api/trackers/:id/changes', authMiddleware, (req, res) => {
+  const tracker = trackers.find(t => t.id === req.params.id && t.userId === req.userId);
+  if (!tracker) return res.status(404).json({ error: 'Not found' });
+  const limit  = Math.min(parseInt(req.query.limit) || 5, 20);
+  const offset = Math.max(parseInt(req.query.offset) || 0, 0);
+  const total  = db.prepare('SELECT COUNT(*) as c FROM changes WHERE trackerId = ?').get(req.params.id).c;
+  const items  = db.prepare(
+    'SELECT id, detectedAt, summary, dismissed, locked FROM changes WHERE trackerId = ? ORDER BY detectedAt DESC LIMIT ? OFFSET ?'
+  ).all(req.params.id, limit, offset);
+  res.json({ items, total, offset, limit });
+});
+
+app.delete('/api/trackers/:id/changes', authMiddleware, (req, res) => {
+  const tracker = trackers.find(t => t.id === req.params.id && t.userId === req.userId);
+  if (!tracker) return res.status(404).json({ error: 'Not found' });
+  db.prepare('DELETE FROM changes WHERE trackerId = ? AND locked = 0').run(req.params.id);
+  const remainingLocked = db.prepare('SELECT COUNT(*) as c FROM changes WHERE trackerId = ?').get(req.params.id).c;
+  tracker.changeCount = remainingLocked;
+  if (remainingLocked === 0) {
+    tracker.changeSummary = null;
+    tracker.changeSnippet = null;
+  }
+  // Only reset 'changed' status if no unread, unlocked changes remain
+  const stillUnread = db.prepare('SELECT COUNT(*) as c FROM changes WHERE trackerId = ? AND dismissed = 0 AND locked = 0').get(req.params.id).c;
+  if (stillUnread === 0 && tracker.status === 'changed') tracker.status = 'ok';
+  saveTrackers(trackers);
+  res.json({ success: true });
 });
 
 // ─── START ────────────────────────────────────────────────────────────────────

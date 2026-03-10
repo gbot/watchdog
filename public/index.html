@@ -62,15 +62,21 @@
     </div>
     <div id="aiResultsPanel" style="display:none">
       <div class="ai-results-toolbar">
-        <span id="aiResultsTitle"></span>
-        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-          <button class="btn btn-text" onclick="aiSelectAll(true)" style="font-size:13px;padding:5px 10px">Select all</button>
-          <button class="btn btn-text" onclick="aiSelectAll(false)" style="font-size:13px;padding:5px 10px">Deselect all</button>
-          <button class="btn btn-primary" id="aiAddSelectedBtn" onclick="openAddSelectedModal()" disabled>
-            <span class="material-icons" style="font-size:17px">playlist_add</span>
-            <span id="aiAddSelectedLabel">Add Selected</span>
-          </button>
+        <div class="ai-toolbar-top">
+          <span id="aiResultsTitle"></span>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+            <button class="btn btn-text" onclick="aiSelectAll(true)" style="font-size:13px;padding:5px 10px">Select all</button>
+            <button class="btn btn-text" onclick="aiSelectAll(false)" style="font-size:13px;padding:5px 10px">Deselect all</button>
+            <button class="btn btn-text" onclick="clearAIResults()" style="font-size:13px;padding:5px 10px;color:var(--on-surface-medium)">
+              <span class="material-icons" style="font-size:16px;vertical-align:middle">close</span> Clear
+            </button>
+            <button class="btn btn-primary" id="aiAddSelectedBtn" onclick="openAddSelectedModal()" disabled>
+              <span class="material-icons" style="font-size:17px">playlist_add</span>
+              <span id="aiAddSelectedLabel">Add Selected</span>
+            </button>
+          </div>
         </div>
+        <div class="ai-category-filters" id="aiCategoryFilters" style="display:none"></div>
       </div>
       <div class="ai-suggestions-list" id="aiSuggestionsList"></div>
     </div>
@@ -80,12 +86,12 @@
   <div class="card add-card">
     <div class="add-card-header">
       <span class="material-icons">add_circle</span>
-      Track a new resource
+      Watch a new resource
     </div>
     <div class="add-form">
       <div class="field" style="grid-column: 1 / -1">
         <label>URL to watch</label>
-        <input type="url" id="urlInput" placeholder="https://example.com/api/data" autocomplete="off" />
+        <input type="url" id="urlInput" placeholder="https://example.com/api/data" autocomplete="off" onblur="prefillLabelFromUrl(this.value)" />
       </div>
       <div class="field">
         <label>Label (optional)</label>
@@ -121,11 +127,11 @@
 
   <!-- TRACKER LIST -->
   <div class="section-header" style="flex-wrap:wrap;row-gap:6px">
-    <span class="section-title">Tracked Resources</span>
+    <span class="section-title">Watch Bots</span>
     <div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap">
       <div class="section-search">
         <span class="material-icons">search</span>
-        <input type="search" id="trackerSearch" placeholder="Filter trackers…" oninput="setTrackerFilter(this.value)" autocomplete="off" />
+        <input type="search" id="trackerSearch" placeholder="Filter WatchBots…" oninput="setTrackerFilter(this.value)" autocomplete="off" />
       </div>
       <span id="trackerFilterCount" style="font-size:12px;color:var(--on-surface-medium);white-space:nowrap;margin:0 2px"></span>
       <div style="display:flex;gap:2px;align-items:center;border-left:1px solid var(--divider);padding-left:6px;margin-left:2px">
@@ -145,8 +151,17 @@
       <div style="display:flex;gap:10px;align-items:center;border-left:1px solid var(--divider);padding-left:8px;margin-left:2px">
         <label style="display:flex;align-items:center;gap:5px;font-size:13px;color:var(--on-surface-medium);cursor:pointer;user-select:none">
           <input type="checkbox" id="showChangedOnlyChk" onchange="setShowChangedOnly(this.checked)" style="accent-color:var(--warning);width:15px;height:15px">
-          Changed only
+          New only
         </label>
+        <button id="dismissAllBtn" onclick="dismissAll()" style="display:none;font-size:13px;padding:4px 10px;color:var(--warning)" class="btn btn-text" title="Mark all changes as read">
+          <span class="material-icons" style="font-size:15px;vertical-align:middle">done_all</span> Mark all read
+        </button>
+        <button id="expandAllBtn" onclick="_tcExpandAll()" style="display:none;font-size:13px;padding:4px 10px;color:var(--on-surface-medium)" class="btn btn-text" title="Expand all change histories">
+          <span class="material-icons" style="font-size:15px;vertical-align:middle">unfold_more</span> Expand all
+        </button>
+        <button id="collapseAllBtn" onclick="_tcCollapseAll()" style="display:none;font-size:13px;padding:4px 10px;color:var(--on-surface-medium)" class="btn btn-text" title="Collapse all change histories">
+          <span class="material-icons" style="font-size:15px;vertical-align:middle">unfold_less</span> Collapse all
+        </button>
         <label style="display:flex;align-items:center;gap:5px;font-size:13px;color:var(--on-surface-medium);cursor:pointer;user-select:none">
           <input type="checkbox" id="showActiveOnlyChk" onchange="setShowActiveOnly(this.checked)" style="accent-color:var(--primary);width:15px;height:15px">
           Active only
@@ -225,7 +240,7 @@
     </div>
     <div class="admin-tabs">
       <button class="admin-tab active" data-tab="users"    onclick="switchAdminTab('users')">Users</button>
-      <button class="admin-tab"        data-tab="trackers" onclick="switchAdminTab('trackers')">Trackers</button>
+      <button class="admin-tab"        data-tab="trackers" onclick="switchAdminTab('trackers')">WatchBots</button>
     </div>
     <div class="admin-body">
       <!-- Users tab -->
