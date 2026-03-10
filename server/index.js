@@ -492,6 +492,7 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.post('/api/auth/logout', (req, res) => {
   res.clearCookie('watchdog_auth');
+  res.clearCookie('watchdog_restore');
   res.json({ success: true });
 });
 
@@ -502,7 +503,8 @@ app.get('/api/auth/me', (req, res) => {
     const payload = jwt.verify(token, JWT_SECRET);
     const user = db.prepare('SELECT role, disabled, notificationsEnabled FROM users WHERE id = ?').get(payload.userId);
     if (!user || user.disabled) return res.status(401).json({ error: 'Not authenticated' });
-    res.json({ id: payload.userId, username: payload.username, role: user.role || 'user', notificationsEnabled: user.notificationsEnabled !== 0 });
+    res.json({ id: payload.userId, username: payload.username, role: user.role || 'user', notificationsEnabled: user.notificationsEnabled !== 0,
+      ...(payload.impersonatedBy ? { impersonatedBy: payload.impersonatedBy } : {}) });
   } catch {
     res.status(401).json({ error: 'Invalid or expired session' });
   }
@@ -663,6 +665,46 @@ app.delete('/api/admin/trackers/:id', adminMiddleware, (req, res) => {
   trackers = trackers.filter(t => t.id !== tracker.id);
   saveTrackers(trackers);
   res.json({ success: true });
+});
+
+app.post('/api/admin/impersonate/:id', adminMiddleware, (req, res) => {
+  const targetId = req.params.id;
+  if (targetId === req.userId) return res.status(400).json({ error: 'Cannot impersonate yourself' });
+  const target = db.prepare('SELECT id, username, role, notificationsEnabled FROM users WHERE id = ?').get(targetId);
+  if (!target) return res.status(404).json({ error: 'User not found' });
+  if (target.disabled) return res.status(400).json({ error: 'Cannot impersonate a disabled account' });
+
+  // Save the admin's current token so they can return later
+  const adminToken = req.cookies.watchdog_auth;
+  res.cookie('watchdog_restore', adminToken, { httpOnly: true, sameSite: 'lax', maxAge: COOKIE_MAX_AGE });
+
+  const impersonateToken = jwt.sign(
+    { userId: target.id, username: target.username, role: target.role || 'user',
+      impersonatedBy: { id: req.userId, username: req.username } },
+    JWT_SECRET, { expiresIn: '7d' }
+  );
+  res.cookie('watchdog_auth', impersonateToken, { httpOnly: true, sameSite: 'lax', maxAge: COOKIE_MAX_AGE });
+  res.json({ id: target.id, username: target.username, role: target.role || 'user',
+    notificationsEnabled: target.notificationsEnabled !== 0,
+    impersonatedBy: { id: req.userId, username: req.username } });
+});
+
+app.post('/api/admin/stop-impersonate', (req, res) => {
+  const restoreToken = req.cookies?.watchdog_restore;
+  if (!restoreToken) return res.status(400).json({ error: 'No impersonation session to restore' });
+  try {
+    jwt.verify(restoreToken, JWT_SECRET);
+  } catch {
+    res.clearCookie('watchdog_restore');
+    res.clearCookie('watchdog_auth');
+    return res.status(401).json({ error: 'Restore token invalid or expired' });
+  }
+  res.cookie('watchdog_auth', restoreToken, { httpOnly: true, sameSite: 'lax', maxAge: COOKIE_MAX_AGE });
+  res.clearCookie('watchdog_restore');
+  const payload = jwt.decode(restoreToken);
+  const user = db.prepare('SELECT role, notificationsEnabled FROM users WHERE id = ?').get(payload.userId);
+  res.json({ id: payload.userId, username: payload.username, role: user?.role || 'superadmin',
+    notificationsEnabled: user?.notificationsEnabled !== 0 });
 });
 
 // ─── API ROUTES ───────────────────────────────────────────────────────────────

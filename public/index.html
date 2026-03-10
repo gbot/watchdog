@@ -604,7 +604,32 @@
 
   body.modal-open { overflow: hidden; }
   body.auth-visible .topbar,
+  body.auth-visible .impersonation-banner,
   body.auth-visible .main { filter: blur(4px); pointer-events: none; user-select: none; }
+
+  /* IMPERSONATION BANNER */
+  .impersonation-banner {
+    background: var(--error);
+    color: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    padding: 10px 24px;
+    font-size: 13px;
+    font-weight: 500;
+    position: sticky;
+    top: 0;
+    z-index: 500;
+  }
+  .impersonation-banner .btn {
+    background: rgba(255,255,255,0.2);
+    color: #fff;
+    border: 1px solid rgba(255,255,255,0.4);
+    padding: 4px 12px;
+    font-size: 12px;
+  }
+  .impersonation-banner .btn:hover { background: rgba(255,255,255,0.32); }
 
   /* AUTH OVERLAY */
   .auth-overlay {
@@ -785,6 +810,14 @@
 </style>
 </head>
 <body>
+
+<div class="impersonation-banner" id="impersonationBanner" style="display:none">
+  <span class="material-icons" style="font-size:18px">manage_accounts</span>
+  <span>Viewing as <strong id="impersonationTarget"></strong> — you are in admin impersonation mode</span>
+  <button class="btn" onclick="stopImpersonating()">
+    <span class="material-icons" style="font-size:16px;vertical-align:middle">logout</span> Return to admin
+  </button>
+</div>
 
 <div class="topbar">
   <div class="topbar-logo">
@@ -1161,7 +1194,15 @@ function showApp() {
   document.getElementById('userDisplay').textContent = currentUser.username;
   document.getElementById('userArea').style.display  = 'flex';
   const adminBtn = document.getElementById('adminPanelBtn');
-  adminBtn.style.display = currentUser.role === 'superadmin' ? 'flex' : 'none';
+  const banner   = document.getElementById('impersonationBanner');
+  if (currentUser.impersonatedBy) {
+    document.getElementById('impersonationTarget').textContent = currentUser.username;
+    banner.style.display = 'flex';
+    adminBtn.style.display = 'none'; // hide admin button while impersonating
+  } else {
+    banner.style.display = 'none';
+    adminBtn.style.display = currentUser.role === 'superadmin' ? 'flex' : 'none';
+  }
   if (currentUser.notificationsEnabled && Notification.permission === 'default') {
     Notification.requestPermission();
   }
@@ -1221,6 +1262,7 @@ async function handleLogout() {
   renderTrackers();
   updateBadge();
   document.getElementById('userArea').style.display = 'none';
+  document.getElementById('impersonationBanner').style.display = 'none';
   showAuthOverlay('login');
 }
 
@@ -1274,7 +1316,11 @@ async function loadAdminTab(tab) {
           <span class="toggle-track"></span>
         </label>`}</td>
         <td style="color:var(--on-surface-medium);font-size:12px">${new Date(u.createdAt).toLocaleDateString()}</td>
-        <td>${u.id === currentUser.id ? '' : `<button class="btn-icon" style="color:var(--error)" title="Delete user" onclick="adminDeleteUser('${u.id}','${escHtml(u.username)}')"><span class="material-icons" style="font-size:18px">person_remove</span></button>`}</td>
+        <td>${u.id === currentUser.id ? '' : `
+          <button class="btn-icon" style="color:var(--primary)" title="Impersonate user" onclick="adminImpersonate('${u.id}','${escHtml(u.username)}')">
+            <span class="material-icons" style="font-size:18px">manage_accounts</span>
+          </button>
+          <button class="btn-icon" style="color:var(--error)" title="Delete user" onclick="adminDeleteUser('${u.id}','${escHtml(u.username)}')"><span class="material-icons" style="font-size:18px">person_remove</span></button>`}</td>
       </tr>`).join('');
   } else {
     const res  = await fetch('/api/admin/trackers');
@@ -1337,6 +1383,29 @@ async function adminDeleteUser(id, username) {
   const res = await fetch(`/api/admin/users/${id}`, { method: 'DELETE' });
   if (res.ok) { showSnackbar(`User ${username} deleted.`); loadAdminTab('users'); }
   else { const d = await res.json(); showSnackbar(d.error || 'Delete failed', 'error'); }
+}
+
+async function adminImpersonate(id, username) {
+  const res = await fetch(`/api/admin/impersonate/${id}`, { method: 'POST' });
+  const data = await res.json();
+  if (!res.ok) { showSnackbar(data.error || 'Failed to impersonate', 'error'); return; }
+  currentUser = data;
+  closeAdminPanel();
+  if (evtSource) { evtSource.close(); evtSource = null; }
+  trackers = [];
+  renderTrackers();
+  showApp();
+}
+
+async function stopImpersonating() {
+  const res = await fetch('/api/admin/stop-impersonate', { method: 'POST' });
+  const data = await res.json();
+  if (!res.ok) { showSnackbar(data.error || 'Failed to restore session', 'error'); return; }
+  currentUser = data;
+  if (evtSource) { evtSource.close(); evtSource = null; }
+  trackers = [];
+  renderTrackers();
+  showApp();
 }
 
 async function adminToggleDisabled(id, disable) {
