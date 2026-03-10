@@ -73,7 +73,7 @@
 
   /* LAYOUT */
   .main {
-    max-width: 960px;
+    max-width: 1280px;
     margin: 0 auto;
     padding: 32px 24px 100px;
   }
@@ -423,7 +423,7 @@
     pointer-events: auto;
   }
   .profile-dialog {
-    width: min(440px, 100%);
+    width: min(520px, 100%);
     background: var(--surface);
     border-radius: 20px;
     box-shadow: var(--elevation-3);
@@ -490,7 +490,7 @@
   }
   .admin-overlay.show { opacity: 1; pointer-events: auto; }
   .admin-dialog {
-    width: min(860px, 100%);
+    width: min(1100px, 100%);
     max-height: 88vh;
     background: var(--surface);
     border-radius: 20px;
@@ -1046,6 +1046,7 @@
               <th>Owner</th>
               <th>Status</th>
               <th>Changes</th>
+              <th>Active</th>
               <th></th>
             </tr>
           </thead>
@@ -1058,7 +1059,7 @@
 
 <!-- EDIT USER MODAL -->
 <div class="profile-overlay" id="editUserOverlay" aria-hidden="true">
-  <div class="profile-dialog" role="dialog" aria-modal="true" aria-labelledby="editUserTitle" style="width:min(480px,100%)">
+  <div class="profile-dialog" role="dialog" aria-modal="true" aria-labelledby="editUserTitle" style="width:min(560px,100%)">
     <div class="profile-dialog-header">
       <div style="display:flex;align-items:center;gap:12px">
         <div class="profile-avatar"><span class="material-icons">edit</span></div>
@@ -1414,7 +1415,7 @@ async function loadAdminTab(tab) {
     const users    = usersRes.ok ? await usersRes.json() : [];
     const userMap  = Object.fromEntries(users.map(u => [u.id, u.username]));
     const tbody    = document.getElementById('adminTrackersBody');
-    if (!all.length) { tbody.innerHTML = `<tr><td colspan="6" class="admin-empty">No trackers found.</td></tr>`; return; }
+    if (!all.length) { tbody.innerHTML = `<tr><td colspan="7" class="admin-empty">No trackers found.</td></tr>`; return; }
     tbody.innerHTML = all.map(t => `
       <tr>
         <td>${escHtml(t.label || t.url)}</td>
@@ -1422,6 +1423,10 @@ async function loadAdminTab(tab) {
         <td style="font-size:12px;color:var(--on-surface-medium)">${escHtml(userMap[t.userId] || t.userId)}</td>
         <td><span class="chip chip-${t.status === 'changed' ? 'changed' : t.status === 'error' ? 'error' : t.active ? 'ok' : 'paused'}" style="font-size:11px">${t.active ? t.status : 'paused'}</span></td>
         <td style="text-align:center">${t.changeCount || 0}</td>
+        <td><label class="toggle-switch" title="${t.active ? 'Disable' : 'Enable'} tracker">
+          <input type="checkbox" ${t.active ? 'checked' : ''} onchange="adminToggleTracker('${t.id}', this.checked)">
+          <span class="toggle-track"></span>
+        </label></td>
         <td><button class="btn-icon" style="color:var(--error)" title="Delete tracker" onclick="adminDeleteTracker('${t.id}','${escHtml(t.label || t.url)}')"><span class="material-icons" style="font-size:18px">delete_outline</span></button></td>
       </tr>`).join('');
   }
@@ -1576,6 +1581,22 @@ async function adminSetTrackerLimit(id, value) {
   });
   if (res.ok) showSnackbar('Tracker limit updated.');
   else { const d = await res.json(); showSnackbar(d.error || 'Update failed', 'error'); }
+}
+
+async function adminToggleTracker(id, active) {
+  const res = await fetch(`/api/admin/trackers/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ active }),
+  });
+  if (res.ok) {
+    showSnackbar(active ? 'Tracker enabled.' : 'Tracker disabled.');
+    loadAdminTab('trackers');
+  } else {
+    const d = await res.json();
+    showSnackbar(d.error || 'Update failed', 'error');
+    loadAdminTab('trackers'); // revert toggle in UI
+  }
 }
 
 async function adminDeleteTracker(id, label) {

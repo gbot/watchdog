@@ -688,6 +688,18 @@ app.get('/api/admin/trackers', adminMiddleware, (req, res) => {
   res.json(trackers.map(({ lastBody, ...rest }) => rest));
 });
 
+app.patch('/api/admin/trackers/:id', adminMiddleware, (req, res) => {
+  const tracker = trackers.find(t => t.id === req.params.id);
+  if (!tracker) return res.status(404).json({ error: 'Not found' });
+  if (req.body.active !== undefined) {
+    tracker.active = !!req.body.active;
+    if (!tracker.active) stopTrackerTimer(tracker.id);
+    else startTrackerTimer(tracker);
+  }
+  saveTrackers(trackers);
+  res.json({ success: true });
+});
+
 app.delete('/api/admin/trackers/:id', adminMiddleware, (req, res) => {
   const tracker = trackers.find(t => t.id === req.params.id);
   if (!tracker) return res.status(404).json({ error: 'Not found' });
