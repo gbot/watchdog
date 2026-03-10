@@ -451,22 +451,27 @@ function adminMiddleware(req, res, next) {
 
 // ─── AUTH ROUTES ─────────────────────────────────────────────────────────────
 app.post('/api/auth/register', async (req, res) => {
-  const { username, password } = req.body;
+  const { username, password, email } = req.body;
   if (!username?.trim() || !password)
     return res.status(400).json({ error: 'Username and password are required' });
+  if (!email?.trim())
+    return res.status(400).json({ error: 'Email address is required' });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()))
+    return res.status(400).json({ error: 'Please enter a valid email address' });
   if (username.trim().length < 3)
     return res.status(400).json({ error: 'Username must be at least 3 characters' });
   if (password.length < 6)
     return res.status(400).json({ error: 'Password must be at least 6 characters' });
 
-  const users = loadUsers();
-  if (users.find(u => u.username.toLowerCase() === username.trim().toLowerCase()))
-    return res.status(409).json({ error: 'That username is already taken' });
+  const existingUsername = db.prepare('SELECT id FROM users WHERE LOWER(username) = LOWER(?)').get(username.trim());
+  if (existingUsername) return res.status(409).json({ error: 'That username is already taken' });
+  const existingEmail = db.prepare('SELECT id FROM users WHERE LOWER(email) = LOWER(?)').get(email.trim());
+  if (existingEmail) return res.status(409).json({ error: 'An account with that email already exists' });
 
   const passwordHash = await bcrypt.hash(password, 12);
-  const user = { id: uuidv4(), username: username.trim(), passwordHash, createdAt: new Date().toISOString() };
-  users.push(user);
-  saveUsers(users);
+  const user = { id: uuidv4(), username: username.trim(), email: email.trim().toLowerCase(), passwordHash, createdAt: new Date().toISOString() };
+  db.prepare('INSERT INTO users (id, username, email, passwordHash, createdAt) VALUES (?, ?, ?, ?, ?)')
+    .run(user.id, user.username, user.email, user.passwordHash, user.createdAt);
 
   const token = jwt.sign({ userId: user.id, username: user.username, role: 'user' }, JWT_SECRET, { expiresIn: '7d' });
   res.cookie('watchdog_auth', token, { httpOnly: true, sameSite: 'lax', maxAge: COOKIE_MAX_AGE });
@@ -484,6 +489,8 @@ app.post('/api/auth/login', async (req, res) => {
 
   const ok = await bcrypt.compare(password, user.passwordHash);
   if (!ok) return res.status(401).json({ error: 'Invalid username or password' });
+
+  if (user.disabled) return res.status(403).json({ error: 'Your account has been deactivated. Please contact an administrator.' });
 
   const token = jwt.sign({ userId: user.id, username: user.username, role: user.role || 'user' }, JWT_SECRET, { expiresIn: '7d' });
   res.cookie('watchdog_auth', token, { httpOnly: true, sameSite: 'lax', maxAge: COOKIE_MAX_AGE });
@@ -570,9 +577,13 @@ app.patch('/api/auth/profile', authMiddleware, async (req, res) => {
 
 // ─── ADMIN ROUTES ─────────────────────────────────────────────────────────────
 app.post('/api/admin/users', adminMiddleware, async (req, res) => {
-  const { username, password, role } = req.body;
+  const { username, email, password, role } = req.body;
   if (!username?.trim() || !password)
     return res.status(400).json({ error: 'Username and password are required' });
+  if (!email?.trim())
+    return res.status(400).json({ error: 'Email address is required' });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()))
+    return res.status(400).json({ error: 'Please enter a valid email address' });
   if (username.trim().length < 3)
     return res.status(400).json({ error: 'Username must be at least 3 characters' });
   if (password.length < 6)
@@ -582,11 +593,13 @@ app.post('/api/admin/users', adminMiddleware, async (req, res) => {
 
   const existing = db.prepare('SELECT id FROM users WHERE LOWER(username) = LOWER(?)').get(username.trim());
   if (existing) return res.status(409).json({ error: 'That username is already taken' });
+  const existingEmail = db.prepare('SELECT id FROM users WHERE LOWER(email) = LOWER(?)').get(email.trim());
+  if (existingEmail) return res.status(409).json({ error: 'An account with that email already exists' });
 
   const passwordHash = await bcrypt.hash(password, 12);
-  const user = { id: uuidv4(), username: username.trim(), passwordHash, role: assignedRole, createdAt: new Date().toISOString() };
-  db.prepare(`INSERT INTO users (id, username, passwordHash, role, createdAt) VALUES (?, ?, ?, ?, ?)`)
-    .run(user.id, user.username, user.passwordHash, user.role, user.createdAt);
+  const user = { id: uuidv4(), username: username.trim(), email: email.trim().toLowerCase(), passwordHash, role: assignedRole, createdAt: new Date().toISOString() };
+  db.prepare('INSERT INTO users (id, username, email, passwordHash, role, createdAt) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(user.id, user.username, user.email, user.passwordHash, user.role, user.createdAt);
   res.status(201).json({ id: user.id, username: user.username, role: user.role });
 });
 
@@ -603,7 +616,7 @@ app.patch('/api/admin/users/:id', adminMiddleware, (req, res) => {
   const user = db.prepare('SELECT id FROM users WHERE id = ?').get(targetId);
   if (!user) return res.status(404).json({ error: 'User not found' });
 
-  const { disabled, trackerLimit } = req.body;
+  const { disabled, trackerLimit, email, role } = req.body;
 
   if (disabled !== undefined) {
     db.prepare('UPDATE users SET disabled = ? WHERE id = ?').run(disabled ? 1 : 0, targetId);
@@ -624,6 +637,23 @@ app.patch('/api/admin/users/:id', adminMiddleware, (req, res) => {
     if (limit !== null && (isNaN(limit) || limit < 0))
       return res.status(400).json({ error: 'Invalid tracker limit' });
     db.prepare('UPDATE users SET trackerLimit = ? WHERE id = ?').run(limit, targetId);
+  }
+
+  if (email !== undefined) {
+    const trimmed = email?.trim() || null;
+    if (trimmed && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed))
+      return res.status(400).json({ error: 'Please enter a valid email address' });
+    if (trimmed) {
+      const conflict = db.prepare('SELECT id FROM users WHERE LOWER(email) = LOWER(?) AND id != ?').get(trimmed, targetId);
+      if (conflict) return res.status(409).json({ error: 'An account with that email already exists' });
+    }
+    db.prepare('UPDATE users SET email = ? WHERE id = ?').run(trimmed ? trimmed.toLowerCase() : null, targetId);
+  }
+
+  if (role !== undefined) {
+    const allowedRoles = ['user', 'superadmin'];
+    if (!allowedRoles.includes(role)) return res.status(400).json({ error: 'Invalid role' });
+    db.prepare('UPDATE users SET role = ? WHERE id = ?').run(role, targetId);
   }
 
   res.json({ success: true });
