@@ -1589,7 +1589,7 @@ function _tcBuildHTML(t, cache) {
   return html;
 }
 
-async function _tcFetch(trackerId, append = false) {
+async function _tcFetch(trackerId, append = false, scrollToBottom = false) {
   if (!_tcCache[trackerId]) {
     _tcCache[trackerId] = { items: [], total: 0, loaded: false, loading: false };
   }
@@ -1609,21 +1609,31 @@ async function _tcFetch(trackerId, append = false) {
     _tcCache[trackerId].total   = total;
     _tcCache[trackerId].loaded  = true;
     _tcCache[trackerId].loading = false;
-    _tcUpdate(trackerId);
+    _tcUpdate(trackerId, scrollToBottom);
   } catch {
     _tcCache[trackerId].loading = false;
   }
 }
 
-function _tcUpdate(trackerId) {
+function _tcUpdate(trackerId, scrollToBottom = false) {
   const container = document.getElementById(`tc-history-${trackerId}`);
   if (!container) return;
   const t = trackers.find(t => t.id === trackerId);
   if (!t) return;
-  // Preserve diff panel open state before rebuilding
+  // Preserve scroll position and diff panel open state before rebuilding
+  const body         = container.querySelector('.tc-body');
+  const savedScroll  = body ? body.scrollTop : 0;
   const diffPanel    = document.getElementById(`diff-panel-${trackerId}`);
   const panelWasOpen = diffPanel?.classList.contains('open');
   container.innerHTML = _tcBuildHTML(t, _tcCache[trackerId]);
+  const newBody = container.querySelector('.tc-body');
+  if (newBody) {
+    if (scrollToBottom) {
+      newBody.scrollTop = newBody.scrollHeight;
+    } else if (savedScroll > 0) {
+      newBody.scrollTop = savedScroll;
+    }
+  }
   if (panelWasOpen) {
     const newPanel = document.getElementById(`diff-panel-${trackerId}`);
     if (newPanel) {
@@ -1635,7 +1645,7 @@ function _tcUpdate(trackerId) {
 }
 
 function _tcLoadMore(trackerId) {
-  _tcFetch(trackerId, true);
+  _tcFetch(trackerId, true, true);
 }
 
 async function _tcDismissAll(trackerId) {
