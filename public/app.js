@@ -247,6 +247,8 @@ function applyPanelPrefs(prefs) {
   const addCard = document.getElementById('addTrackerCard');
   if (aiCard)  aiCard.style.display  = prefs?.hideAiFinder   ? 'none' : '';
   if (addCard) addCard.style.display = prefs?.hideAddTracker ? 'none' : '';
+  const maxH = prefs?.changesMaxHeight > 0 ? `${prefs.changesMaxHeight}px` : '';
+  document.documentElement.style.setProperty('--changes-max-height', maxH || 'none');
   // Restore collapsed state from localStorage — suppress animation during initial restore
   const _CARD_COLLAPSE_KEY = 'watchdog_card_collapsed';
   let collapsed = [];
@@ -1041,6 +1043,8 @@ async function openProfile() {
       document.getElementById('profileGlobalEmail').checked   = profile.globalEmailNotify  !== false;
       document.getElementById('profileHideAiFinder').checked   = profile.hideAiFinder   === true;
       document.getElementById('profileHideAddTracker').checked = profile.hideAddTracker  === true;
+      document.getElementById('profileChangesMaxHeight').value  = profile.changesMaxHeight || 0;
+      applyPanelPrefs(profile);
     }
   } catch {}
 
@@ -1191,6 +1195,12 @@ async function saveProfileGlobalEmail(enabled) {
       body:    JSON.stringify({ globalEmailNotify: enabled }),
     });
   } catch {}
+}
+
+async function saveChangesMaxHeight(val) {
+  const h = val >= 100 ? Math.min(val, 2000) : 0;
+  document.getElementById('profileChangesMaxHeight').value = h;
+  await saveProfilePanelPref('changesMaxHeight', h);
 }
 
 async function saveProfilePanelPref(key, value) {

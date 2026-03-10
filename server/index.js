@@ -78,6 +78,7 @@ try { db.exec('ALTER TABLE users ADD COLUMN notificationsEnabled INTEGER NOT NUL
 try { db.exec('ALTER TABLE users ADD COLUMN globalEmailNotify   INTEGER NOT NULL DEFAULT 1'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN hideAiFinder        INTEGER NOT NULL DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN hideAddTracker      INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE users ADD COLUMN changesMaxHeight    INTEGER NOT NULL DEFAULT 0'); } catch {}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
@@ -1002,7 +1003,7 @@ app.get('/api/auth/me', (req, res) => {
   }
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const user = db.prepare('SELECT role, disabled, notificationsEnabled, hideAiFinder, hideAddTracker, trackerLimit FROM users WHERE id = ?').get(payload.userId);
+    const user = db.prepare('SELECT role, disabled, notificationsEnabled, hideAiFinder, hideAddTracker, changesMaxHeight, trackerLimit FROM users WHERE id = ?').get(payload.userId);
     if (!user || user.disabled) return res.status(401).json({ error: 'Not authenticated' });
     const role = user.role || 'user';
     if (getSetting('maintenanceMode', '0') === '1' && role !== 'admin')
@@ -1011,6 +1012,7 @@ app.get('/api/auth/me', (req, res) => {
       notificationsEnabled: user.notificationsEnabled !== 0,
       hideAiFinder:         user.hideAiFinder  === 1,
       hideAddTracker:       user.hideAddTracker === 1,
+      changesMaxHeight:     user.changesMaxHeight || 0,
       trackerLimit:         user.trackerLimit ?? null,
       ...(payload.impersonatedBy ? { impersonatedBy: payload.impersonatedBy } : {}) });
   } catch {
@@ -1019,7 +1021,7 @@ app.get('/api/auth/me', (req, res) => {
 });
 
 app.get('/api/auth/profile', authMiddleware, (req, res) => {
-  const user = db.prepare('SELECT id, username, email, createdAt, notificationsEnabled, globalEmailNotify, hideAiFinder, hideAddTracker FROM users WHERE id = ?').get(req.userId);
+  const user = db.prepare('SELECT id, username, email, createdAt, notificationsEnabled, globalEmailNotify, hideAiFinder, hideAddTracker, changesMaxHeight FROM users WHERE id = ?').get(req.userId);
   if (!user) return res.status(404).json({ error: 'User not found' });
   res.json({
     ...user,
@@ -1027,6 +1029,7 @@ app.get('/api/auth/profile', authMiddleware, (req, res) => {
     globalEmailNotify:    user.globalEmailNotify    !== 0,
     hideAiFinder:         user.hideAiFinder         === 1,
     hideAddTracker:       user.hideAddTracker        === 1,
+    changesMaxHeight:     user.changesMaxHeight      || 0,
   });
 });
 
@@ -1052,7 +1055,7 @@ app.delete('/api/auth/profile', authMiddleware, async (req, res) => {
 app.patch('/api/auth/profile', authMiddleware, async (req, res) => {
   const { email, currentPassword, newPassword } = req.body;
 
-  if (email === undefined && newPassword === undefined && req.body.notificationsEnabled === undefined && req.body.globalEmailNotify === undefined && req.body.hideAiFinder === undefined && req.body.hideAddTracker === undefined)
+  if (email === undefined && newPassword === undefined && req.body.notificationsEnabled === undefined && req.body.globalEmailNotify === undefined && req.body.hideAiFinder === undefined && req.body.hideAddTracker === undefined && req.body.changesMaxHeight === undefined)
     return res.status(400).json({ error: 'Nothing to update' });
 
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
@@ -1083,6 +1086,12 @@ app.patch('/api/auth/profile', authMiddleware, async (req, res) => {
   if (req.body.hideAddTracker !== undefined) {
     db.prepare('UPDATE users SET hideAddTracker = ? WHERE id = ?')
       .run(req.body.hideAddTracker ? 1 : 0, req.userId);
+  }
+
+  if (req.body.changesMaxHeight !== undefined) {
+    const h = parseInt(req.body.changesMaxHeight) || 0;
+    db.prepare('UPDATE users SET changesMaxHeight = ? WHERE id = ?')
+      .run(h >= 100 ? h : 0, req.userId);
   }
 
   if (newPassword !== undefined) {

@@ -1236,6 +1236,15 @@
     white-space: nowrap;
     flex-shrink: 0;
   }
+  .tc-body {
+    max-height: var(--changes-max-height, none);
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: #d0d0d0 transparent;
+  }
+  .tc-body::-webkit-scrollbar { width: 5px; }
+  .tc-body::-webkit-scrollbar-thumb { background: #d0d0d0; border-radius: 3px; }
+  .tc-body::-webkit-scrollbar-track { background: transparent; }
   .tc-loading {
     padding: 8px 20px;
     font-size: 12px;
