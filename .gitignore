@@ -2,3 +2,12 @@
 /node_modules
 /package-lock.json
 /data
+
+# SQLite WAL/SHM files if data dir is ever unignored
+*.db-shm
+*.db-wal
+
+# Editor / OS
+*.code-workspace
+.DS_Store
+Thumbs.db
