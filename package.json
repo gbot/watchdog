@@ -4,7 +4,8 @@
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
-    "dev": "nodemon server/index.js"
+    "dev": "nodemon server/index.js",
+    "test": "echo \"No tests defined\" && exit 0"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1005.0",

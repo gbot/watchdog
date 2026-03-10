@@ -1,6 +1,6 @@
-# Watchbot 🐕
+# WatchBot 🐕
 
-A self-hosted web change tracker. Add URLs, set a polling interval, and Watchbot will notify you whenever the content changes — with an AI-generated summary of what changed.
+A self-hosted web change tracker. Add URLs, set a polling interval, and WatchBot will notify you whenever the content changes — with an AI-generated summary of what changed.
 
 ---
 

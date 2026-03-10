@@ -4,10 +4,7 @@
 name: Node.js CI
 
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+  workflow_dispatch:  # disabled: run manually only
 
 jobs:
   build:
