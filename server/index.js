@@ -10,6 +10,10 @@ const bcrypt       = require('bcryptjs');
 const jwt          = require('jsonwebtoken');
 const cookieParser = require('cookie-parser');
 const { SESClient, SendEmailCommand } = require('@aws-sdk/client-ses');
+const { S3Client, PutObjectCommand, HeadObjectCommand } = require('@aws-sdk/client-s3');
+
+const S3_MEDIA_BUCKET = process.env.S3_MEDIA_BUCKET || '';
+const CDN_BASE_URL    = (process.env.CDN_BASE_URL || '').replace(/\/$/, '');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -72,6 +76,8 @@ try { db.exec('ALTER TABLE users ADD COLUMN disabled          INTEGER NOT NULL D
 try { db.exec('ALTER TABLE users ADD COLUMN trackerLimit      INTEGER'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN notificationsEnabled INTEGER NOT NULL DEFAULT 1'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN globalEmailNotify   INTEGER NOT NULL DEFAULT 1'); } catch {}
+try { db.exec('ALTER TABLE users ADD COLUMN hideAiFinder        INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE users ADD COLUMN hideAddTracker      INTEGER NOT NULL DEFAULT 0'); } catch {}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
@@ -115,6 +121,11 @@ db.exec(`
     oldHash      TEXT,
     newHash      TEXT
   );
+
+  CREATE TABLE IF NOT EXISTS site_settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
 `);
 
 // Migrations for existing DBs
@@ -123,6 +134,16 @@ try { db.prepare('ALTER TABLE changes ADD COLUMN locked   INTEGER DEFAULT 0').ru
 try { db.prepare('ALTER TABLE changes ADD COLUMN soft      INTEGER DEFAULT 0').run(); } catch {}
 try { db.prepare('ALTER TABLE changes ADD COLUMN snippet   TEXT').run(); } catch {}
 try { db.prepare('ALTER TABLE trackers ADD COLUMN emailNotify INTEGER DEFAULT 0').run(); } catch {}
+try { db.prepare('ALTER TABLE trackers ADD COLUMN faviconUrl TEXT').run(); } catch {}
+
+// ─── SITE SETTINGS HELPERS ───────────────────────────────────────────────────
+function getSetting(key, defaultVal = null) {
+  const row = db.prepare('SELECT value FROM site_settings WHERE key = ?').get(key);
+  return row ? row.value : defaultVal;
+}
+function setSetting(key, value) {
+  db.prepare('INSERT OR REPLACE INTO site_settings (key, value) VALUES (?, ?)').run(key, String(value));
+}
 
 // Indexes for query performance — idempotent, safe to run on every startup
 db.exec(`
@@ -137,9 +158,10 @@ const _selectUserForAuth = db.prepare('SELECT id, role, disabled FROM users WHER
 function rowToTracker(row) {
   return {
     ...row,
-    active:       row.active      === 1,
-    aiSummary:    row.aiSummary   !== 0,
-    emailNotify:  row.emailNotify === 1,
+    active:        row.active      === 1,
+    aiSummary:     row.aiSummary   !== 0,
+    emailNotify:   row.emailNotify === 1,
+    faviconUrl:    row.faviconUrl  || null,
     changeSnippet: row.changeSnippet ? JSON.parse(row.changeSnippet) : null,
   };
 }
@@ -164,18 +186,19 @@ const _upsertTracker = db.prepare(`
   INSERT INTO trackers
     (id, userId, label, url, interval, active, status, lastCheck, lastHash,
      lastBody, httpStatus, changeCount, changeSummary, changeSnippet, error,
-     aiSummary, createdAt, position, emailNotify)
+     aiSummary, createdAt, position, emailNotify, faviconUrl)
   VALUES
     (@id, @userId, @label, @url, @interval, @active, @status, @lastCheck, @lastHash,
      @lastBody, @httpStatus, @changeCount, @changeSummary, @changeSnippet, @error,
-     @aiSummary, @createdAt, @position, @emailNotify)
+     @aiSummary, @createdAt, @position, @emailNotify, @faviconUrl)
   ON CONFLICT(id) DO UPDATE SET
     label=excluded.label, url=excluded.url, interval=excluded.interval,
     active=excluded.active, status=excluded.status, lastCheck=excluded.lastCheck,
     lastHash=excluded.lastHash, lastBody=excluded.lastBody, httpStatus=excluded.httpStatus,
     changeCount=excluded.changeCount, changeSummary=excluded.changeSummary,
     changeSnippet=excluded.changeSnippet, error=excluded.error,
-    aiSummary=excluded.aiSummary, position=excluded.position, emailNotify=excluded.emailNotify
+    aiSummary=excluded.aiSummary, position=excluded.position, emailNotify=excluded.emailNotify,
+    faviconUrl=excluded.faviconUrl
 `);
 
 function saveTrackers(list) {
@@ -374,15 +397,15 @@ let trackers = loadTrackers();
 
 // ─── EMAIL (AWS SES API) ─────────────────────────────────────────────────────
 function _isSesConfigured() {
-  return !!(process.env.AWS_REGION && process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY);
+  return !!(process.env.SES_REGION && process.env.SES_ACCESS_KEY_ID && process.env.SES_SECRET_ACCESS_KEY);
 }
 
 function _sesClient() {
   return new SESClient({
-    region: process.env.AWS_REGION,
+    region: process.env.SES_REGION,
     credentials: {
-      accessKeyId:     process.env.AWS_ACCESS_KEY_ID,
-      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+      accessKeyId:     process.env.SES_ACCESS_KEY_ID,
+      secretAccessKey: process.env.SES_SECRET_ACCESS_KEY,
     },
   });
 }
@@ -570,6 +593,102 @@ function computeDiffSnippet(oldText, newText) {
   };
 }
 
+// ─── FAVICON ──────────────────────────────────────────────────────────────────
+const _s3 = S3_MEDIA_BUCKET
+  ? new S3Client({
+      region: process.env.S3_REGION || 'us-east-1',
+      ...(process.env.S3_ACCESS_KEY_ID && process.env.S3_SECRET_ACCESS_KEY ? {
+        credentials: {
+          accessKeyId:     process.env.S3_ACCESS_KEY_ID,
+          secretAccessKey: process.env.S3_SECRET_ACCESS_KEY,
+        }
+      } : {}),
+    })
+  : null;
+
+// In-memory cache so re-launching the server avoids redundant S3 HEAD calls.
+const _faviconDomainCache = {};
+
+async function fetchAndStoreFavicon(trackerUrl) {
+  // S3 upload is optional — requires S3_MEDIA_BUCKET + credentials to be configured.
+  // Favicons are served directly by the browser in the meantime.
+  if (!_s3 || !CDN_BASE_URL || !process.env.S3_ACCESS_KEY_ID) return null;
+
+  let origin, hostname;
+  try {
+    const parsed = new URL(trackerUrl);
+    origin   = parsed.origin;   // e.g. "https://example.com"
+    hostname = parsed.hostname; // e.g. "example.com"
+  } catch { return null; }
+
+  if (_faviconDomainCache[hostname]) return _faviconDomainCache[hostname];
+
+  const s3Key = `favicons/${hostname}.ico`;
+
+  // Check if already stored in S3
+  try {
+    await _s3.send(new HeadObjectCommand({ Bucket: S3_MEDIA_BUCKET, Key: s3Key }));
+    const cdnUrl = `${CDN_BASE_URL}/${s3Key}`;
+    _faviconDomainCache[hostname] = cdnUrl;
+    return cdnUrl;
+  } catch (e) {
+    if (e.name !== 'NotFound' && e.$metadata?.httpStatusCode !== 404) {
+      log('~', _c.dim, `Favicon S3 HEAD error for ${hostname}: ${e.message}`);
+    }
+  }
+
+  // Try fetching /favicon.ico directly
+  let iconBuf = null;
+  let contentType = 'image/x-icon';
+  try {
+    const r = await axios.get(`${origin}/favicon.ico`,
+      { responseType: 'arraybuffer', timeout: 5000, validateStatus: s => s === 200 });
+    if (r.data?.byteLength > 0) {
+      iconBuf = Buffer.from(r.data);
+      contentType = r.headers['content-type']?.split(';')[0] || 'image/x-icon';
+    }
+  } catch {}
+
+  // Fallback: parse <link rel="icon"> from the page HTML
+  if (!iconBuf) {
+    try {
+      const r = await axios.get(trackerUrl,
+        { responseType: 'text', timeout: 8000, validateStatus: s => s === 200 });
+      const match = r.data.match(/<link[^>]+rel=["'](?:shortcut )?icon["'][^>]*href=["']([^"']+)["']/i)
+                 || r.data.match(/<link[^>]+href=["']([^"']+)["'][^>]*rel=["'](?:shortcut )?icon["']/i);
+      if (match) {
+        const iconHref = new URL(match[1], origin).href;
+        const ir = await axios.get(iconHref,
+          { responseType: 'arraybuffer', timeout: 5000, validateStatus: s => s === 200 });
+        if (ir.data?.byteLength > 0) {
+          iconBuf = Buffer.from(ir.data);
+          contentType = ir.headers['content-type']?.split(';')[0] || 'image/x-icon';
+        }
+      }
+    } catch {}
+  }
+
+  if (!iconBuf) return null;
+
+  // Upload to S3
+  try {
+    await _s3.send(new PutObjectCommand({
+      Bucket:      S3_MEDIA_BUCKET,
+      Key:         s3Key,
+      Body:        iconBuf,
+      ContentType: contentType,
+      CacheControl: 'public, max-age=604800',
+    }));
+    const cdnUrl = `${CDN_BASE_URL}/${s3Key}`;
+    _faviconDomainCache[hostname] = cdnUrl;
+    log('✓', _c.green, `Favicon stored  ${hostname}  →  ${cdnUrl}`);
+    return cdnUrl;
+  } catch (e) {
+    log('~', _c.dim, `Favicon S3 PUT error for ${hostname}: ${e.message}`);
+    return null;
+  }
+}
+
 async function checkTracker(tracker) {
   const now = new Date().toISOString();
   log('↻', _c.dim, `Checking  ${tracker.url}`);
@@ -609,7 +728,7 @@ async function checkTracker(tracker) {
       let summary;
       if (preflightSoft) {
         summary = 'No significant content changes detected.';
-      } else if (tracker.aiSummary === false) {
+      } else if (tracker.aiSummary === false || getSetting('aiEnabled', '1') === '0') {
         summary = 'Content changed.';
       } else {
         summary = await getChangeSummary(tracker.lastBody, structuredText, tracker.url);
@@ -670,6 +789,16 @@ async function checkTracker(tracker) {
     tracker.lastCheck = now;
     tracker.error     = err.message;
     log('✗', _c.red, `Error     "${tracker.label}"  — ${err.message}`);
+  }
+
+  // Lazy favicon fetch — non-blocking; only runs once per domain
+  if (!tracker.faviconUrl) {
+    fetchAndStoreFavicon(tracker.url).then(cdnUrl => {
+      if (cdnUrl) {
+        tracker.faviconUrl = cdnUrl;
+        _saveOneTracker(tracker);
+      }
+    }).catch(() => {});
   }
 
   _saveOneTracker(tracker);
@@ -776,6 +905,9 @@ function authMiddleware(req, res, next) {
     req.userId   = payload.userId;
     req.username = payload.username;
     req.role     = payload.role || 'user';
+    if (getSetting('maintenanceMode', '0') === '1' && req.role !== 'superadmin') {
+      return res.status(503).json({ error: 'The site is currently undergoing maintenance. Please try again later.' });
+    }
     next();
   } catch {
     return res.status(401).json({ error: 'Invalid or expired session' });
@@ -789,8 +921,18 @@ function adminMiddleware(req, res, next) {
   });
 }
 
+// ─── PUBLIC SETTINGS ENDPOINT ──────────────────────────────────────────────────
+app.get('/api/settings', (req, res) => {
+  res.json({
+    allowRegistration: getSetting('allowRegistration', '1') !== '0',
+    maintenanceMode:   getSetting('maintenanceMode',   '0') === '1',
+  });
+});
+
 // ─── AUTH ROUTES ─────────────────────────────────────────────────────────────
 app.post('/api/auth/register', async (req, res) => {
+  if (getSetting('allowRegistration', '1') === '0')
+    return res.status(403).json({ error: 'Registration is currently disabled.' });
   const { username, password, email } = req.body;
   if (!username?.trim() || !password)
     return res.status(400).json({ error: 'Username and password are required' });
@@ -809,9 +951,13 @@ app.post('/api/auth/register', async (req, res) => {
   if (existingEmail) return res.status(409).json({ error: 'An account with that email already exists' });
 
   const passwordHash = await bcrypt.hash(password, 12);
+  const initLimit = (() => {
+    const g = parseInt(getSetting('defaultTrackerLimit', '0') || '0');
+    return g > 0 ? g : null;
+  })();
   const user = { id: uuidv4(), username: username.trim(), email: email.trim().toLowerCase(), passwordHash, createdAt: new Date().toISOString() };
-  db.prepare('INSERT INTO users (id, username, email, passwordHash, createdAt) VALUES (?, ?, ?, ?, ?)')
-    .run(user.id, user.username, user.email, user.passwordHash, user.createdAt);
+  db.prepare('INSERT INTO users (id, username, email, passwordHash, createdAt, trackerLimit) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(user.id, user.username, user.email, user.passwordHash, user.createdAt, initLimit);
 
   const token = jwt.sign({ userId: user.id, username: user.username, role: 'user' }, JWT_SECRET, { expiresIn: '7d' });
   res.cookie('watchbot_auth', token, { httpOnly: true, sameSite: 'lax', maxAge: COOKIE_MAX_AGE });
@@ -845,12 +991,24 @@ app.post('/api/auth/logout', (req, res) => {
 
 app.get('/api/auth/me', (req, res) => {
   const token = req.cookies?.watchbot_auth;
-  if (!token) return res.status(401).json({ error: 'Not authenticated' });
+  if (!token) {
+    // No session — still check maintenance so unauthenticated visitors get 503
+    if (getSetting('maintenanceMode', '0') === '1')
+      return res.status(503).json({ error: 'System maintenance in progress.' });
+    return res.status(401).json({ error: 'Not authenticated' });
+  }
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const user = db.prepare('SELECT role, disabled, notificationsEnabled FROM users WHERE id = ?').get(payload.userId);
+    const user = db.prepare('SELECT role, disabled, notificationsEnabled, hideAiFinder, hideAddTracker, trackerLimit FROM users WHERE id = ?').get(payload.userId);
     if (!user || user.disabled) return res.status(401).json({ error: 'Not authenticated' });
-    res.json({ id: payload.userId, username: payload.username, role: user.role || 'user', notificationsEnabled: user.notificationsEnabled !== 0,
+    const role = user.role || 'user';
+    if (getSetting('maintenanceMode', '0') === '1' && role !== 'superadmin')
+      return res.status(503).json({ error: 'System maintenance in progress.' });
+    res.json({ id: payload.userId, username: payload.username, role,
+      notificationsEnabled: user.notificationsEnabled !== 0,
+      hideAiFinder:         user.hideAiFinder  === 1,
+      hideAddTracker:       user.hideAddTracker === 1,
+      trackerLimit:         user.trackerLimit ?? null,
       ...(payload.impersonatedBy ? { impersonatedBy: payload.impersonatedBy } : {}) });
   } catch {
     res.status(401).json({ error: 'Invalid or expired session' });
@@ -858,9 +1016,15 @@ app.get('/api/auth/me', (req, res) => {
 });
 
 app.get('/api/auth/profile', authMiddleware, (req, res) => {
-  const user = db.prepare('SELECT id, username, email, createdAt, notificationsEnabled, globalEmailNotify FROM users WHERE id = ?').get(req.userId);
+  const user = db.prepare('SELECT id, username, email, createdAt, notificationsEnabled, globalEmailNotify, hideAiFinder, hideAddTracker FROM users WHERE id = ?').get(req.userId);
   if (!user) return res.status(404).json({ error: 'User not found' });
-  res.json({ ...user, notificationsEnabled: user.notificationsEnabled !== 0, globalEmailNotify: user.globalEmailNotify !== 0 });
+  res.json({
+    ...user,
+    notificationsEnabled: user.notificationsEnabled !== 0,
+    globalEmailNotify:    user.globalEmailNotify    !== 0,
+    hideAiFinder:         user.hideAiFinder         === 1,
+    hideAddTracker:       user.hideAddTracker        === 1,
+  });
 });
 
 app.delete('/api/auth/profile', authMiddleware, async (req, res) => {
@@ -885,7 +1049,7 @@ app.delete('/api/auth/profile', authMiddleware, async (req, res) => {
 app.patch('/api/auth/profile', authMiddleware, async (req, res) => {
   const { email, currentPassword, newPassword } = req.body;
 
-  if (email === undefined && newPassword === undefined && req.body.notificationsEnabled === undefined && req.body.globalEmailNotify === undefined)
+  if (email === undefined && newPassword === undefined && req.body.notificationsEnabled === undefined && req.body.globalEmailNotify === undefined && req.body.hideAiFinder === undefined && req.body.hideAddTracker === undefined)
     return res.status(400).json({ error: 'Nothing to update' });
 
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
@@ -906,6 +1070,16 @@ app.patch('/api/auth/profile', authMiddleware, async (req, res) => {
   if (req.body.globalEmailNotify !== undefined) {
     db.prepare('UPDATE users SET globalEmailNotify = ? WHERE id = ?')
       .run(req.body.globalEmailNotify ? 1 : 0, req.userId);
+  }
+
+  if (req.body.hideAiFinder !== undefined) {
+    db.prepare('UPDATE users SET hideAiFinder = ? WHERE id = ?')
+      .run(req.body.hideAiFinder ? 1 : 0, req.userId);
+  }
+
+  if (req.body.hideAddTracker !== undefined) {
+    db.prepare('UPDATE users SET hideAddTracker = ? WHERE id = ?')
+      .run(req.body.hideAddTracker ? 1 : 0, req.userId);
   }
 
   if (newPassword !== undefined) {
@@ -956,6 +1130,26 @@ app.post('/api/auth/test-email', authMiddleware, async (req, res) => {
 });
 
 // ─── ADMIN ROUTES ─────────────────────────────────────────────────────────────
+app.get('/api/admin/settings', adminMiddleware, (req, res) => {
+  res.json({
+    allowRegistration:   getSetting('allowRegistration',   '1') !== '0',
+    aiEnabled:           getSetting('aiEnabled',           '1') !== '0',
+    maintenanceMode:     getSetting('maintenanceMode',     '0') === '1',
+    defaultTrackerLimit: parseInt(getSetting('defaultTrackerLimit', '0') || '0'),
+  });
+});
+
+app.patch('/api/admin/settings', adminMiddleware, (req, res) => {
+  const allowed = ['allowRegistration', 'aiEnabled', 'maintenanceMode', 'defaultTrackerLimit'];
+  for (const key of allowed) {
+    if (key in req.body) {
+      const val = req.body[key];
+      setSetting(key, typeof val === 'boolean' ? (val ? '1' : '0') : String(val));
+    }
+  }
+  res.json({ ok: true });
+});
+
 app.post('/api/admin/users', adminMiddleware, async (req, res) => {
   const { username, email, password, role } = req.body;
   if (!username?.trim() || !password)
@@ -977,9 +1171,13 @@ app.post('/api/admin/users', adminMiddleware, async (req, res) => {
   if (existingEmail) return res.status(409).json({ error: 'An account with that email already exists' });
 
   const passwordHash = await bcrypt.hash(password, 12);
+  const initLimit = (() => {
+    const g = parseInt(getSetting('defaultTrackerLimit', '0') || '0');
+    return g > 0 ? g : null;
+  })();
   const user = { id: uuidv4(), username: username.trim(), email: email.trim().toLowerCase(), passwordHash, role: assignedRole, createdAt: new Date().toISOString() };
-  db.prepare('INSERT INTO users (id, username, email, passwordHash, role, createdAt) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(user.id, user.username, user.email, user.passwordHash, user.role, user.createdAt);
+  db.prepare('INSERT INTO users (id, username, email, passwordHash, role, createdAt, trackerLimit) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(user.id, user.username, user.email, user.passwordHash, user.role, user.createdAt, initLimit);
   res.status(201).json({ id: user.id, username: user.username, role: user.role });
 });
 
@@ -1287,10 +1485,12 @@ app.post('/api/trackers', authMiddleware, async (req, res) => {
   try { new URL(url); } catch { return res.status(400).json({ error: 'Invalid URL' }); }
 
   const userRow = db.prepare('SELECT trackerLimit FROM users WHERE id = ?').get(req.userId);
-  if (userRow?.trackerLimit != null) {
+  // null or 0 = unlimited; positive integer = hard cap. Global default is only applied at user creation.
+  const effectiveLimit = (userRow?.trackerLimit > 0) ? userRow.trackerLimit : null;
+  if (effectiveLimit !== null) {
     const count = trackers.filter(t => t.userId === req.userId).length;
-    if (count >= userRow.trackerLimit)
-      return res.status(403).json({ error: `Tracker limit reached (${userRow.trackerLimit})` });
+    if (count >= effectiveLimit)
+      return res.status(403).json({ error: `WatchBot limit reached (${effectiveLimit})` });
   }
 
   const tracker = {
@@ -1308,6 +1508,7 @@ app.post('/api/trackers', authMiddleware, async (req, res) => {
     error:        null,
     aiSummary:    aiSummary === true,
     emailNotify:  emailNotify === true,
+    faviconUrl:   null,
     createdAt:    new Date().toISOString(),
     userId:       req.userId
   };
@@ -1319,6 +1520,14 @@ app.post('/api/trackers', authMiddleware, async (req, res) => {
 
   const { lastBody, ...safe } = tracker;
   res.status(201).json(safe);
+
+  // Fetch favicon in the background — don't block the response
+  fetchAndStoreFavicon(tracker.url).then(cdnUrl => {
+    if (cdnUrl && !tracker.faviconUrl) {
+      tracker.faviconUrl = cdnUrl;
+      _saveOneTracker(tracker);
+    }
+  }).catch(() => {});
 });
 
 app.patch('/api/trackers/reorder', authMiddleware, (req, res) => {

@@ -101,17 +101,81 @@ async function init() {
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/sw.js').catch(() => {});
   }
+  // Load public site settings (drives registration visibility, maintenance mode)
   try {
-    const res = await fetch('/api/auth/me');
-    if (res.ok) {
-      currentUser = await res.json();
+    const sr = await fetch('/api/settings');
+    if (sr.ok) siteSettings = await sr.json();
+  } catch {}
+
+  // Check session
+  let meRes;
+  try { meRes = await fetch('/api/auth/me'); } catch {}
+
+  if (meRes?.ok) {
+    currentUser = await meRes.json();
+    if (siteSettings.maintenanceMode && currentUser.role !== 'superadmin') {
+      // Logged-in non-admin hit maintenance — log them out silently then show overlay
+      await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+      currentUser = null;
+      showMaintenanceOverlay();
+    } else {
       showApp();
+    }
+  } else if (meRes?.status === 503) {
+    // Server is in maintenance mode and rejected the session
+    showMaintenanceOverlay();
+  } else {
+    // Not logged in — but still check if site is in maintenance before showing login
+    if (siteSettings.maintenanceMode) {
+      showMaintenanceOverlay();
     } else {
       showAuthOverlay('login');
     }
-  } catch {
-    showAuthOverlay('login');
   }
+}
+
+let _maintPollTimer = null;
+
+function showMaintenanceOverlay() {
+  // Close any SSE connection first
+  if (evtSource) { evtSource.close(); evtSource = null; }
+  // Hide auth overlay / app just in case
+  hideAuthOverlay();
+  document.getElementById('userArea').style.display = 'none';
+
+  const overlay = document.getElementById('maintenanceOverlay');
+  overlay.classList.add('show');
+  overlay.setAttribute('aria-hidden', 'false');
+  document.body.classList.add('modal-open', 'maintenance-active');
+
+  // Poll every 20 seconds — auto-dismiss when maintenance ends
+  clearInterval(_maintPollTimer);
+  let pollCount = 0;
+  _maintPollTimer = setInterval(async () => {
+    pollCount++;
+    const el = document.getElementById('maintChecking');
+    try {
+      const sr = await fetch('/api/settings');
+      if (!sr.ok) return;
+      const s = await sr.json();
+      if (!s.maintenanceMode) {
+        hideMaintenanceOverlay();
+        siteSettings = s;
+        showAuthOverlay('login');
+      } else if (el) {
+        el.textContent = `Checking for updates… (${pollCount})`;
+      }
+    } catch {}
+  }, 20000);
+}
+
+function hideMaintenanceOverlay() {
+  clearInterval(_maintPollTimer);
+  _maintPollTimer = null;
+  const overlay = document.getElementById('maintenanceOverlay');
+  overlay.classList.remove('show');
+  overlay.setAttribute('aria-hidden', 'true');
+  document.body.classList.remove('modal-open', 'maintenance-active');
 }
 
 // ─── AUTH UI ──────────────────────────────────────────────────────────────────
@@ -135,6 +199,10 @@ function hideAuthOverlay() {
 }
 
 function switchAuthTab(tab) {
+  // If registration is disabled, force to login and hide the tab button
+  const regTabBtn = document.querySelector('.auth-tab[data-tab="register"]');
+  if (regTabBtn) regTabBtn.style.display = siteSettings.allowRegistration ? '' : 'none';
+  if (!siteSettings.allowRegistration && tab === 'register') tab = 'login';
   document.querySelectorAll('.auth-tab').forEach(t =>
     t.classList.toggle('active', t.dataset.tab === tab)
   );
@@ -160,6 +228,10 @@ function showApp() {
   if (currentUser.notificationsEnabled && Notification.permission === 'default') {
     Notification.requestPermission();
   }
+  // Apply panel visibility prefs from the user object (populated by /api/auth/me)
+  applyPanelPrefs(currentUser);
+  // Restore cached AI finder results if any
+  _aiCacheRestore();
   // Sync filter state with whatever the browser restored on reload
   showChangedOnly = document.getElementById('showChangedOnlyChk')?.checked ?? false;
   showActiveOnly  = document.getElementById('showActiveOnlyChk')?.checked  ?? false;
@@ -167,6 +239,39 @@ function showApp() {
   showLockedOnly  = document.getElementById('showLockedOnlyChk')?.checked  ?? false;
   trackerFilter   = (document.getElementById('trackerSearch')?.value ?? '').trim().toLowerCase();
   connectSSE();
+}
+
+function applyPanelPrefs(prefs) {
+  const aiCard  = document.getElementById('aiFinderCard');
+  const addCard = document.getElementById('addTrackerCard');
+  if (aiCard)  aiCard.style.display  = prefs?.hideAiFinder   ? 'none' : '';
+  if (addCard) addCard.style.display = prefs?.hideAddTracker ? 'none' : '';
+  // Restore collapsed state from localStorage — suppress animation during initial restore
+  const _CARD_COLLAPSE_KEY = 'watchdog_card_collapsed';
+  let collapsed = [];
+  try { collapsed = JSON.parse(localStorage.getItem(_CARD_COLLAPSE_KEY)) || []; } catch {}
+  ['aiFinderCard', 'addTrackerCard'].forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    // Add no-transition sentinel so CSS transition doesn't fire on page load
+    el.classList.add('no-transition');
+    el.classList.toggle('card-collapsed', collapsed.includes(id));
+    // Remove sentinel after layout has settled
+    requestAnimationFrame(() => requestAnimationFrame(() => el.classList.remove('no-transition')));
+  });
+}
+
+function toggleCardCollapse(cardId) {
+  const card = document.getElementById(cardId);
+  if (!card) return;
+  card.classList.toggle('card-collapsed');
+  // Persist
+  const _CARD_COLLAPSE_KEY = 'watchdog_card_collapsed';
+  const collapsed = ['aiFinderCard', 'addTrackerCard'].filter(id => {
+    const el = document.getElementById(id);
+    return el?.classList.contains('card-collapsed');
+  });
+  try { localStorage.setItem(_CARD_COLLAPSE_KEY, JSON.stringify(collapsed)); } catch {}
 }
 
 async function handleLogin(e) {
@@ -232,7 +337,7 @@ let adminCurrentTab = 'users';
 
 async function openAdminPanel() {
   // Clear cache and reset search/page/selection state every time the panel opens
-  _adminCache            = { users: null, trackers: null, userMap: null };
+  _adminCache            = { users: null, trackers: null, userMap: null, settings: null };
   adminUsersSearchVal    = '';
   adminUsersPage         = 0;
   adminTrackersSearchVal = '';
@@ -264,13 +369,23 @@ function switchAdminTab(tab) {
   );
   document.getElementById('adminUsersTab').style.display    = tab === 'users'    ? '' : 'none';
   document.getElementById('adminTrackersTab').style.display = tab === 'trackers' ? '' : 'none';
+  document.getElementById('adminSettingsTab').style.display = tab === 'settings' ? '' : 'none';
   // Reset to page 0 each time a tab is (re-)selected
   if (tab === 'users') adminUsersPage = 0;
-  else adminTrackersPage = 0;
+  else if (tab === 'trackers') adminTrackersPage = 0;
   loadAdminTab(tab);
 }
 
 async function loadAdminTab(tab, forceRefresh = true) {
+  if (tab === 'settings') {
+    if (forceRefresh || !_adminCache.settings) {
+      const res = await fetch('/api/admin/settings');
+      if (!res.ok) return;
+      _adminCache.settings = await res.json();
+    }
+    renderAdminSettingsTab(_adminCache.settings);
+    return;
+  }
   if (tab === 'users') {
     if (forceRefresh || !_adminCache.users) {
       const res = await fetch('/api/admin/users');
@@ -290,6 +405,83 @@ async function loadAdminTab(tab, forceRefresh = true) {
       _adminCache.userMap = Object.fromEntries(_adminCache.users.map(u => [u.id, u.username]));
     }
     renderAdminTrackersTable(_adminCache.trackers, _adminCache.userMap || {});
+  }
+}
+
+function renderAdminSettingsTab(s) {
+  const el = document.getElementById('adminSettingsTab');
+  if (!el) return;
+  el.innerHTML = `
+    <div style="max-width:560px">
+      <h4 style="font-size:13px;font-weight:700;color:var(--on-surface-medium);text-transform:uppercase;letter-spacing:0.6px;margin:0 0 18px">Site Settings</h4>
+
+      <div style="display:flex;flex-direction:column;gap:18px">
+
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding-bottom:16px;border-bottom:1px solid var(--divider)">
+          <div>
+            <div style="font-size:14px;font-weight:600">User registration</div>
+            <div style="font-size:12px;color:var(--on-surface-medium);margin-top:3px">Allow new users to create accounts from the login screen.</div>
+          </div>
+          <label class="toggle" style="flex-shrink:0;margin-top:2px" data-tip="${s.allowRegistration ? 'Disable registration' : 'Enable registration'}">
+            <input type="checkbox" ${s.allowRegistration ? 'checked' : ''} onchange="saveAdminSetting('allowRegistration', this.checked)">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding-bottom:16px;border-bottom:1px solid var(--divider)">
+          <div>
+            <div style="font-size:14px;font-weight:600">AI summaries</div>
+            <div style="font-size:12px;color:var(--on-surface-medium);margin-top:3px">Master switch for all Anthropic AI API calls. Disabling saves API costs site-wide.</div>
+          </div>
+          <label class="toggle" style="flex-shrink:0;margin-top:2px" data-tip="${s.aiEnabled ? 'Disable AI' : 'Enable AI'}">
+            <input type="checkbox" ${s.aiEnabled ? 'checked' : ''} onchange="saveAdminSetting('aiEnabled', this.checked)">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding-bottom:16px;border-bottom:1px solid var(--divider)">
+          <div>
+            <div style="font-size:14px;font-weight:600">Maintenance mode</div>
+            <div style="font-size:12px;color:var(--on-surface-medium);margin-top:3px">Blocks all non-admin users from the app. Admins are unaffected.</div>
+          </div>
+          <label class="toggle" style="flex-shrink:0;margin-top:2px" data-tip="${s.maintenanceMode ? 'Disable maintenance mode' : 'Enable maintenance mode'}">
+            <input type="checkbox" ${s.maintenanceMode ? 'checked' : ''} onchange="saveAdminSetting('maintenanceMode', this.checked)">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px">
+          <div style="flex:1">
+            <div style="font-size:14px;font-weight:600">Default WatchBot limit</div>
+            <div style="font-size:12px;color:var(--on-surface-medium);margin-top:3px">Max WatchBots per user when no per-user override is set. <strong>0</strong> = unlimited.</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
+            <input type="number" id="adminDefaultTrackerLimit" min="0" step="1" value="${s.defaultTrackerLimit}"
+              style="width:70px;padding:6px 8px;border:1px solid var(--divider);border-radius:8px;font-size:13px;background:var(--surface);color:var(--on-surface);text-align:right"
+              onchange="saveAdminSetting('defaultTrackerLimit', parseInt(this.value) || 0)" />
+          </div>
+        </div>
+
+      </div>
+    </div>
+  `;
+}
+
+async function saveAdminSetting(key, value) {
+  try {
+    const res = await fetch('/api/admin/settings', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ [key]: value })
+    });
+    if (!res.ok) throw new Error();
+    if (_adminCache.settings) _adminCache.settings[key] = value;
+    // Keep public siteSettings in sync for registration/maintenance
+    if (key === 'allowRegistration') siteSettings.allowRegistration = value;
+    if (key === 'maintenanceMode')   siteSettings.maintenanceMode   = value;
+    showSnackbar('Setting saved');
+  } catch {
+    showSnackbar('Failed to save setting', 'error');
   }
 }
 
@@ -318,7 +510,7 @@ function renderAdminUsersTable(users) {
         <td>${u.trackerCount}</td>
         <td>${u.id === currentUser.id ? '—' : `<input type="number" min="0" value="${u.trackerLimit ?? ''}" placeholder="∞"
           style="width:56px;padding:3px 6px;border:1px solid var(--divider);border-radius:6px;font-size:12px;background:var(--surface)"
-          onchange="adminSetTrackerLimit('${u.id}', this.value)" title="Max trackers (blank = unlimited)" />`}</td>
+          onchange="adminSetTrackerLimit('${u.id}', this.value)" title="Max WatchBots (0 or blank = unlimited)" />`}</td>
         <td>${u.id === currentUser.id ? '' : `<label class="toggle-switch" data-tip="${u.disabled ? 'Enable' : 'Disable'} account">
           <input type="checkbox" ${u.disabled ? '' : 'checked'} onchange="adminToggleDisabled('${u.id}', !this.checked)">
           <span class="toggle-track"></span>
@@ -326,7 +518,7 @@ function renderAdminUsersTable(users) {
         <td style="color:var(--on-surface-medium);font-size:12px">${new Date(u.createdAt).toLocaleDateString()}</td>
         <td>${u.id === currentUser.id ? '' : `
           <div class="btn-group">
-            <button class="btn-icon" style="color:var(--on-surface-medium)" data-tip="Edit user" onclick="openEditUser('${u.id}','${escHtml(u.username)}','${escHtml(u.email||'')}','${u.role}','${u.trackerLimit??''}')">
+            <button class="btn-icon" style="color:var(--on-surface-medium)" data-tip="Edit user" onclick="openEditUser('${u.id}','${escHtml(u.username)}','${escHtml(u.email||'')}','${u.role}')">
               <span class="material-icons" style="font-size:18px">edit</span>
             </button>
             <button class="btn-icon" style="color:var(--primary)" data-tip="Impersonate user" onclick="adminImpersonate('${u.id}','${escHtml(u.username)}')">
@@ -409,7 +601,7 @@ async function adminBulkDeleteUsers() {
   const count = adminUsersSelected.size;
   if (count === 0) return;
   const ok = await openDeleteConfirmDialog(
-    `${count} user${count !== 1 ? 's' : ''} and all their trackers`,
+    `${count} user${count !== 1 ? 's' : ''} and all their WatchBots`,
     `Delete ${count} user${count !== 1 ? 's' : ''}?`
   );
   if (!ok) return;
@@ -461,7 +653,7 @@ function renderAdminTrackersTable(all, userMap) {
 
   const tbody = document.getElementById('adminTrackersBody');
   if (!filtered.length) {
-    tbody.innerHTML = `<tr><td colspan="9" class="admin-empty">${q ? 'No trackers match your search.' : 'No trackers found.'}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9" class="admin-empty">${q ? 'No WatchBots match your search.' : 'No WatchBots found.'}</td></tr>`;
   } else {
     tbody.innerHTML = page.map(t => `
       <tr>
@@ -472,11 +664,11 @@ function renderAdminTrackersTable(all, userMap) {
         <td style="font-size:12px;color:var(--on-surface-medium);white-space:nowrap">${intervalText(t.interval)}</td>
         <td><span class="chip chip-${t.status === 'changed' ? 'changed' : t.status === 'error' ? 'error' : t.active ? 'ok' : 'paused'}" style="font-size:11px">${t.active ? t.status : 'paused'}</span></td>
         <td style="text-align:center">${t.changeCount || 0}</td>
-        <td><label class="toggle-switch" data-tip="${t.active ? 'Disable' : 'Enable'} tracker">
+        <td><label class="toggle-switch" data-tip="${t.active ? 'Disable' : 'Enable'} WatchBot">
           <input type="checkbox" ${t.active ? 'checked' : ''} onchange="adminToggleTracker('${t.id}', this.checked)">
           <span class="toggle-track"></span>
         </label></td>
-        <td><button class="btn-icon" style="color:var(--error)" data-tip="Delete tracker" onclick="adminDeleteTracker('${t.id}','${escHtml(t.label || t.url)}')"><span class="material-icons" style="font-size:18px">delete_outline</span></button></td>
+        <td><button class="btn-icon" style="color:var(--error)" data-tip="Delete WatchBot" onclick="adminDeleteTracker('${t.id}','${escHtml(t.label || t.url)}')"><span class="material-icons" style="font-size:18px">delete_outline</span></button></td>
       </tr>`).join('');
   }
   _syncAdminTrackersSelectAll();
@@ -537,7 +729,7 @@ function _updateAdminTrackersBulkBar() {
   const disableBtn = document.getElementById('adminTrkBulkDisableBtn');
   const deleteBtn  = document.getElementById('adminTrkBulkDeleteBtn');
   const clearBtn   = document.getElementById('adminTrkClearSelBtn');
-  if (countEl)    countEl.textContent        = count > 0 ? `${count} tracker${count !== 1 ? 's' : ''} selected` : '';
+  if (countEl)    countEl.textContent        = count > 0 ? `${count} WatchBot${count !== 1 ? 's' : ''} selected` : '';
   if (enableBtn)  enableBtn.disabled         = count === 0;
   if (disableBtn) disableBtn.disabled        = count === 0;
   if (deleteBtn)  deleteBtn.disabled         = count === 0;
@@ -547,7 +739,7 @@ function _updateAdminTrackersBulkBar() {
 async function adminBulkDeleteTrackers() {
   const count = adminTrackersSelected.size;
   if (count === 0) return;
-  const ok = await openDeleteConfirmDialog(`${count} tracker${count !== 1 ? 's' : ''}`, `Delete ${count} tracker${count !== 1 ? 's' : ''}?`);
+  const ok = await openDeleteConfirmDialog(`${count} WatchBot${count !== 1 ? 's' : ''}`, `Delete ${count} WatchBot${count !== 1 ? 's' : ''}?`);
   if (!ok) return;
   const ids = [...adminTrackersSelected];
   adminTrackersSelected.clear();
@@ -557,7 +749,7 @@ async function adminBulkDeleteTrackers() {
     if (!res.ok) failed++;
   }));
   if (failed > 0) showSnackbar(`${failed} deletion${failed !== 1 ? 's' : ''} failed.`, 'error');
-  else showSnackbar(`${ids.length} tracker${ids.length !== 1 ? 's' : ''} deleted.`);
+  else showSnackbar(`${ids.length} WatchBot${ids.length !== 1 ? 's' : ''} deleted.`);
   _adminCache.trackers = null;
   loadAdminTab('trackers');
 }
@@ -576,7 +768,7 @@ async function adminBulkToggleTrackers(active) {
     if (!res.ok) failed++;
   }));
   if (failed > 0) showSnackbar(`${failed} update${failed !== 1 ? 's' : ''} failed.`, 'error');
-  else showSnackbar(`${ids.length} tracker${ids.length !== 1 ? 's' : ''} ${active ? 'enabled' : 'disabled'}.`);
+  else showSnackbar(`${ids.length} WatchBot${ids.length !== 1 ? 's' : ''} ${active ? 'enabled' : 'disabled'}.`);
   _adminCache.trackers = null;
   loadAdminTab('trackers');
 }
@@ -694,12 +886,13 @@ async function stopImpersonating() {
 // ─── EDIT USER ───────────────────────────────────────────────────────────────
 let editUserId = null;
 
-function openEditUser(id, username, email, role, limit) {
+function openEditUser(id, username, email, role) {
   editUserId = id;
+  const cached = _adminCache.users?.find(u => u.id === id);
   document.getElementById('editUserSubtitle').textContent = username;
   document.getElementById('editUserEmail').value = email;
   document.getElementById('editUserRole').value = role;
-  document.getElementById('editUserLimit').value = limit;
+  document.getElementById('editUserLimit').value = cached?.trackerLimit ?? '';
   document.getElementById('editUserMsg').textContent = '';
   document.getElementById('editUserMsg').className = 'profile-msg';
   const overlay = document.getElementById('editUserOverlay');
@@ -772,8 +965,14 @@ async function adminSetTrackerLimit(id, value) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ trackerLimit: limit }),
   });
-  if (res.ok) showSnackbar('Tracker limit updated.');
-  else { const d = await res.json(); showSnackbar(d.error || 'Update failed', 'error'); }
+  if (res.ok) {
+    // Keep cache in sync so the edit modal reads the current value
+    if (_adminCache.users) {
+      const u = _adminCache.users.find(u => u.id === id);
+      if (u) u.trackerLimit = limit;
+    }
+    showSnackbar('WatchBot limit updated.');
+  } else { const d = await res.json(); showSnackbar(d.error || 'Update failed', 'error'); }
 }
 
 async function adminToggleTracker(id, active) {
@@ -783,7 +982,7 @@ async function adminToggleTracker(id, active) {
     body: JSON.stringify({ active }),
   });
   if (res.ok) {
-    showSnackbar(active ? 'Tracker enabled.' : 'Tracker disabled.');
+    showSnackbar(active ? 'WatchBot enabled.' : 'WatchBot disabled.');
     loadAdminTab('trackers');
   } else {
     const d = await res.json();
@@ -793,13 +992,13 @@ async function adminToggleTracker(id, active) {
 }
 
 async function adminDeleteTracker(id, label) {
-  const ok = await openDeleteConfirmDialog(`tracker "${label}"`, 'Delete tracker?');
+  const ok = await openDeleteConfirmDialog(`WatchBot "${label}"`, 'Delete WatchBot?');
   if (!ok) return;
   const res = await fetch(`/api/admin/trackers/${id}`, { method: 'DELETE' });
   if (res.ok) {
     adminTrackersSelected.delete(id);
     _adminCache.trackers = null;
-    showSnackbar('Tracker deleted.');
+    showSnackbar('WatchBot deleted.');
     loadAdminTab('trackers');
   } else { const d = await res.json(); showSnackbar(d.error || 'Delete failed', 'error'); }
 }
@@ -827,6 +1026,8 @@ async function openProfile() {
       document.getElementById('profileEmail').value = profile.email || '';
       document.getElementById('profileNotifications').checked = profile.notificationsEnabled !== false;
       document.getElementById('profileGlobalEmail').checked   = profile.globalEmailNotify  !== false;
+      document.getElementById('profileHideAiFinder').checked   = profile.hideAiFinder   === true;
+      document.getElementById('profileHideAddTracker').checked = profile.hideAddTracker  === true;
     }
   } catch {}
 
@@ -979,6 +1180,18 @@ async function saveProfileGlobalEmail(enabled) {
   } catch {}
 }
 
+async function saveProfilePanelPref(key, value) {
+  try {
+    await fetch('/api/auth/profile', {
+      method:  'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ [key]: value }),
+    });
+    if (currentUser) currentUser[key] = value;
+    applyPanelPrefs(currentUser);
+  } catch {}
+}
+
 async function deleteAccount() {
   const pw    = document.getElementById('profileDeletePw').value;
   const msgEl = document.getElementById('profileDeleteMsg');
@@ -1069,7 +1282,19 @@ function connectSSE() {
       }
     }
   };
-  evtSource.onerror = () => {
+  evtSource.onerror = async () => {
+    // Check if the session is now blocked by maintenance mode
+    try {
+      const probe = await fetch('/api/auth/me');
+      if (probe.status === 503) {
+        currentUser = null;
+        trackers    = [];
+        renderTrackers();
+        updateBadge();
+        showMaintenanceOverlay();
+        return;
+      }
+    } catch {}
     setTimeout(() => { if (currentUser) connectSSE(); }, 5000);
   };
 }
@@ -1133,11 +1358,11 @@ async function addTracker() {
 async function removeTracker(id) {
   const t = trackers.find(t => t.id === id);
   if (!t) return;
-  const shouldDelete = await openDeleteConfirmDialog(`tracker "${t.label}"`, 'Delete tracker?'); 
+  const shouldDelete = await openDeleteConfirmDialog(`WatchBot "${t.label}"`, 'Delete WatchBot?');
   if (!shouldDelete) return;
   try {
     const res = await fetch(`/api/trackers/${id}`, { method: 'DELETE' });
-    if (!res.ok) { showSnackbar('Failed to delete tracker', 'error'); }
+    if (!res.ok) { showSnackbar('Failed to delete WatchBot', 'error'); }
   } catch {
     showSnackbar('Connection error', 'error');
   }
@@ -1247,14 +1472,14 @@ function _tcBuildHTML(t, cache) {
   let html = `<div class="tc-header">
     <span class="material-icons" style="font-size:16px;flex-shrink:0;color:var(--on-surface-medium)">history</span>
     <span class="tc-title">History</span>
+    <button class="tc-icon-btn tc-icon-btn-delete" data-tip="Delete all history" onclick="_tcDeleteHistory('${t.id}')" style="margin-left:16px">
+      <span class="material-icons">delete_outline</span>
+    </button>
     ${showUnreadBadge ? `<span class="tc-unread-badge">${badgeLabel}</span>` : ''}
     ${showUnreadBadge && unreadCount > 0 ? `<button class="btn btn-text tc-mark-all-read-btn" onclick="_tcDismissAll('${t.id}')">Mark all read</button>` : ''}
     <span style="flex:1"></span>
-    <button class="tc-icon-btn" data-tip="${toggleTitle}" onclick="_tcToggleHistory('${t.id}')">
+    <button class="tc-icon-btn tc-toggle-history-btn" data-tip="${toggleTitle}" onclick="_tcToggleHistory('${t.id}')">
       <span class="material-icons tc-toggle-btn-icon">${toggleIcon}</span>
-    </button>
-    <button class="tc-icon-btn tc-icon-btn-delete" data-tip="Delete all history" onclick="_tcDeleteHistory('${t.id}')">
-      <span class="material-icons">delete_outline</span>
     </button>
   </div>`;
 
@@ -1291,11 +1516,13 @@ function _tcBuildHTML(t, cache) {
 
   // Cache is loaded — render stacked history entries (newest first).
   // Apply active filter to entries too.
-  const visibleItems = showLockedOnly
-    ? cache.items.filter(i => i.locked)
-    : showChangedOnly
-      ? cache.items.filter(i => !i.dismissed)
-      : cache.items;
+  const visibleItems = cache.items.filter(i => {
+    if (!showChangedOnly && !showLockedOnly) return true;
+    // Union: entry is shown if it satisfies any active filter
+    if (showChangedOnly && !i.dismissed) return true;
+    if (showLockedOnly  && i.locked)     return true;
+    return false;
+  });
 
   visibleItems.forEach((item, idx) => {
     const entryUnread = !item.dismissed;
@@ -1446,6 +1673,7 @@ function _tcToggleHistory(id) {
   } else {
     _tcCollapsed.add(id);
   }
+  _tcCollapseSave();
   // Swap the icon and re-render just the header button without a full rebuild
   const icon = container.querySelector('.tc-toggle-btn-icon');
   if (icon) {
@@ -1516,6 +1744,7 @@ async function _tcDeleteHistory(id) {
     if (!res.ok) throw new Error();
     delete _tcCache[id];
     _tcCollapsed.delete(id);
+    _tcCollapseSave();
     // SSE broadcast from server will push updated tracker (changeCount:0) → re-render
   } catch {
     showSnackbar('Failed to delete history', 'error');
@@ -1551,6 +1780,13 @@ async function dismissAll() {
   await Promise.all(changed.map(t =>
     fetch(`/api/trackers/${t.id}/dismiss`, { method: 'POST' }).catch(() => {})
   ));
+  // Clear the "Show unread" filter so trackers don't all vanish after marking read
+  if (showChangedOnly) {
+    showChangedOnly = false;
+    const chk = document.getElementById('showChangedOnlyChk');
+    if (chk) chk.checked = false;
+    renderTrackers();
+  }
 }
 
 // ─── RENDER ───────────────────────────────────────────────────────────────────
@@ -1558,13 +1794,28 @@ function renderTrackers() {
   const list = document.getElementById('trackerList');
 
   const filtered = trackers.filter(t => {
-    if (showChangedOnly && t.status !== 'changed') return false;
-    if (showActiveOnly  && !t.active)              return false;
-    if (showAIOnly      && t.aiSummary === false)   return false;
-    if (showLockedOnly  && !(t.lockedCount > 0))   return false;
+    if (showActiveOnly  && !t.active)            return false;
+    if (showAIOnly      && t.aiSummary === false) return false;
     if (trackerFilter &&
         !(t.label || '').toLowerCase().includes(trackerFilter) &&
         !(t.url   || '').toLowerCase().includes(trackerFilter)) return false;
+    // Unread / locked filters: use loaded cache for precision; fall back to tracker-level counters
+    if (showChangedOnly || showLockedOnly) {
+      const cache = _tcCache[t.id];
+      if (cache?.loaded) {
+        // Tracker visible if any entry satisfies any active filter (OR)
+        const hasMatch = cache.items.some(i =>
+          (showChangedOnly && !i.dismissed) || (showLockedOnly && i.locked)
+        );
+        if (!hasMatch) return false;
+      } else {
+        // Cache not yet loaded — use coarse proxy flags (OR)
+        if (!(
+          (showChangedOnly && t.status === 'changed') ||
+          (showLockedOnly  && t.lockedCount > 0)
+        )) return false;
+      }
+    }
     return true;
   });
 
@@ -1771,20 +2022,21 @@ async function moveToTop(id) {
 }
 
 function trackerHTML(t) {
-  const statusClass = !t.active             ? 'status-pending' :
-                      t.status === 'checking' ? 'status-pending' :
-                      t.status === 'changed'  ? 'status-changed' :
-                      t.status === 'error'    ? 'status-error'   :
-                      t.status === 'ok'       ? 'status-ok'      : 'status-pending';
+  const statusClass = t.status === 'checking' ? 'status-pending' :
+                      !t.active              ? 'status-pending' :
+                      t.status === 'changed' ? 'status-changed' :
+                      t.status === 'error'   ? 'status-error'   :
+                      t.status === 'ok'      ? 'status-ok'      : 'status-pending';
 
-  const chipClass = !t.active            ? 'chip-paused'  :
-                    t.status === 'changed' ? 'chip-changed' :
-                    t.status === 'error'   ? 'chip-error'   :
-                    t.status === 'ok'      ? 'chip-ok'      : '';
+  const chipClass = t.status === 'checking' ? '' :
+                    !t.active               ? 'chip-paused'  :
+                    t.status === 'changed'  ? 'chip-changed' :
+                    t.status === 'error'    ? 'chip-error'   :
+                    t.status === 'ok'       ? 'chip-ok'      : '';
 
-  const chipLabel = !t.active             ? 'Paused' :
+  const chipLabel = t.status === 'checking' ? 'Checking…' :
+                    !t.active               ? 'Paused' :
                     t.status === 'changed'  ? `${t.changeCount} change${t.changeCount !== 1 ? 's' : ''}` :
-                    t.status === 'checking' ? 'Checking…' :
                     t.status === 'error'    ? 'Error' :
                     t.status === 'ok'       ? 'No changes' : 'Pending';
 
@@ -1810,8 +2062,11 @@ function trackerHTML(t) {
       <span class="drag-handle material-icons" data-tip="Drag to reorder">drag_indicator</span>
       <span class="tracker-status ${statusClass}"></span>
       <div class="tracker-info">
-        <div class="tracker-name">${escHtml(t.label)}</div>
-        <div class="tracker-url">${escHtml(t.url)}</div>
+        ${(() => { let src = t.faviconUrl; if (!src) { try { const h = new URL(t.url).hostname; src = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(h)}&sz=32`; } catch {} } return src ? `<img src="${escHtml(src)}" alt="" class="tracker-favicon" onerror="this.style.display='none'" loading="lazy">` : ''; })()}
+        <div class="tracker-info-text">
+          <div class="tracker-name">${escHtml(t.label)}</div>
+          <div class="tracker-url">${escHtml(t.url)}</div>
+        </div>
       </div>
       <span class="chip ${chipClass}" style="margin-right:8px">${chipLabel}</span>
       <div class="tracker-meta">
@@ -1830,9 +2085,9 @@ function trackerHTML(t) {
         </label>
         <button class="btn-icon tracker-action-icon" onclick="moveToTop('${t.id}')" data-tip="Move to top" ${trackers[0]?.id === t.id ? 'disabled style="opacity:0.25;cursor:default"' : ''}><span class="material-icons">vertical_align_top</span></button>
         <a class="btn-icon tracker-action-icon material-icons" href="${escHtml(t.url)}" target="_blank" rel="noopener noreferrer" data-tip="Open URL in new tab" style="text-decoration:none">open_in_new</a>
+        <button class="btn-icon tracker-action-icon material-icons" style="color:var(--error)" onclick="removeTracker('${t.id}')" data-tip="Remove">delete_outline</button>
         <button class="btn-icon tracker-action-icon material-icons" onclick="toggleEdit('${t.id}')" data-tip="Edit">edit</button>
         <button class="btn-icon tracker-action-icon material-icons" onclick="checkTracker('${t.id}')" data-tip="Check now" ${t.status === 'checking' ? 'disabled' : ''}>refresh</button>
-        <button class="btn-icon tracker-action-icon material-icons" style="color:var(--error)" onclick="removeTracker('${t.id}')" data-tip="Remove">delete_outline</button>
       </div>
     </div>
     ${editingId === t.id ? `
@@ -1877,7 +2132,9 @@ function trackerHTML(t) {
 
 function updateBadge() {
   const active = trackers.filter(t => t.active).length;
-  document.getElementById('activeCount').textContent = `${active} active`;
+  const limit = currentUser && currentUser.trackerLimit ? currentUser.trackerLimit : null;
+  const limitStr = limit ? limit : '<span style="font-size:22px;line-height:1;vertical-align:middle">∞</span>';
+  document.getElementById('activeCount').innerHTML = `${active} active / ${limitStr}`;
   const btn = document.getElementById('dismissAllBtn');
   if (btn) btn.style.display = trackers.some(t => t.status === 'changed') ? '' : 'none';
   const hasHistory = trackers.some(t => t.changeCount > 0);
@@ -1913,13 +2170,42 @@ let aiSuggestions        = [];
 let aiVisibleCount       = 10;
 let aiCategoryFilter     = null;
 const AI_PAGE_SIZE       = 10;
+const _AI_CACHE_KEY      = 'watchdog_ai_results';
 let _trackerOptResolver  = null;
 let _trackerOptEscHandler = null;
 
+function _aiCacheSave(query) {
+  try {
+    localStorage.setItem(_AI_CACHE_KEY, JSON.stringify({
+      query,
+      suggestions: aiSuggestions.map(s => ({ ...s, selected: false })),
+    }));
+  } catch {}
+}
+
+function _aiCacheRestore() {
+  try {
+    const cached = JSON.parse(localStorage.getItem(_AI_CACHE_KEY));
+    if (!cached?.suggestions?.length) return;
+    aiSuggestions  = cached.suggestions;
+    aiVisibleCount = AI_PAGE_SIZE;
+    aiCategoryFilter = null;
+    document.getElementById('aiSearchInput').value = cached.query || '';
+    document.getElementById('aiResultsPanel').style.display = '';
+    _renderAISuggestions(cached.query || '');
+  } catch {}
+}
+
 // Per-tracker change history cache: trackerId → { items, total, loaded, loading }
 const _tcCache = {};
-// Trackers whose history panel is collapsed
-const _tcCollapsed = new Set();
+// Trackers whose history panel is collapsed — persisted in localStorage
+const _TC_COLLAPSED_KEY = 'watchdog_tc_collapsed';
+function _tcCollapseSave() {
+  try { localStorage.setItem(_TC_COLLAPSED_KEY, JSON.stringify([..._tcCollapsed])); } catch {}
+}
+const _tcCollapsed = new Set(
+  (() => { try { return JSON.parse(localStorage.getItem(_TC_COLLAPSED_KEY)) || []; } catch { return []; } })()
+);
 
 const AI_CATEGORY_CLASS = {
   'News':     'ai-cat-news',
@@ -1939,6 +2225,7 @@ function clearAIResults() {
   document.getElementById('aiResultsPanel').style.display = 'none';
   document.getElementById('aiSearchInput').value = '';
   document.getElementById('aiSearchInput').focus();
+  try { localStorage.removeItem(_AI_CACHE_KEY); } catch {}
 }
 
 async function prefillLabelFromUrl(url) {
@@ -1990,6 +2277,7 @@ async function searchAIResources() {
   aiSuggestions    = (data.suggestions || []).map(s => ({ ...s, selected: false }));
     aiVisibleCount   = AI_PAGE_SIZE;
     aiCategoryFilter = null;
+    _aiCacheSave(query);
     _renderAISuggestions(query);
   } catch {
     showSnackbar('Connection error', 'error');
@@ -2169,7 +2457,7 @@ async function _addSelectedTrackers(selected) {
   const aiSummary    = document.getElementById('toAiSummary').checked;
   const emailNotify  = document.getElementById('toEmailNotify').checked;
 
-  let added = 0, failed = 0;
+  let added = 0, failed = 0, lastError = null;
 
   for (const s of selected) {
     try {
@@ -2184,7 +2472,7 @@ async function _addSelectedTrackers(selected) {
         if (idx >= 0) aiSuggestions[idx].selected = false;
       } else {
         const d = await res.json().catch(() => ({}));
-        if (d.error) showSnackbar(d.error, 'error');
+        if (d.error) lastError = d.error;
         failed++;
       }
     } catch { failed++; }
@@ -2194,11 +2482,11 @@ async function _addSelectedTrackers(selected) {
   _renderAISuggestions(query);
 
   if (added > 0 && failed === 0)
-    showSnackbar(`Added ${added} tracker${added !== 1 ? 's' : ''} successfully!`);
+    showSnackbar(`Added ${added} WatchBot${added !== 1 ? 's' : ''} successfully!`);
   else if (added > 0)
-    showSnackbar(`Added ${added} tracker${added !== 1 ? 's' : ''}; ${failed} failed.`, 'error');
+    showSnackbar(`Added ${added} WatchBot${added !== 1 ? 's' : ''}; ${failed} failed.${lastError ? ' ' + lastError : ''}`, 'error');
   else
-    showSnackbar(`Failed to add tracker${failed !== 1 ? 's' : ''}.`, 'error');
+    showSnackbar(lastError || `Failed to add WatchBot${failed !== 1 ? 's' : ''}.`, 'error');
 }
 
 let snackTimer;

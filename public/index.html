@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Watchbot — HTTP Change Tracker</title>
+<title>WatchBot - Web Resource Change Tracker</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
 <link rel="stylesheet" href="/style.css">
@@ -43,10 +43,12 @@
 
   <!-- AI RESOURCE FINDER -->
   <div class="card ai-finder-card" id="aiFinderCard">
-    <div class="add-card-header">
+    <div class="add-card-header collapsible-header" onclick="toggleCardCollapse('aiFinderCard')">
       <span class="material-icons" style="color:#7c4dff">auto_awesome</span>
       AI Resource Finder
+      <span class="material-icons collapse-chevron" id="aiFinderChevron" style="margin-left:auto;font-size:20px;color:var(--on-surface-medium)">expand_less</span>
     </div>
+    <div class="card-collapsible-body" id="aiFinderBody">
     <div class="ai-finder-form">
       <div class="field" style="flex:1">
         <label for="aiSearchInput">What are you interested in tracking?</label>
@@ -80,14 +82,17 @@
       </div>
       <div class="ai-suggestions-list" id="aiSuggestionsList"></div>
     </div>
+    </div><!-- /card-collapsible-body -->
   </div>
 
   <!-- ADD TRACKER FORM -->
-  <div class="card add-card">
-    <div class="add-card-header">
+  <div class="card add-card" id="addTrackerCard">
+    <div class="add-card-header collapsible-header" onclick="toggleCardCollapse('addTrackerCard')">
       <span class="material-icons">add_circle</span>
       Watch a new resource
+      <span class="material-icons collapse-chevron" id="addTrackerChevron" style="margin-left:auto;font-size:20px;color:var(--on-surface-medium)">expand_less</span>
     </div>
+    <div class="card-collapsible-body" id="addTrackerBody">
     <div class="add-form">
       <div class="field" style="grid-column: 1 / -1">
         <label>URL to watch</label>
@@ -123,6 +128,7 @@
         <span class="material-icons" style="font-size:18px">add</span> Add
       </button>
     </div>
+    </div><!-- /card-collapsible-body -->
   </div>
 
   <!-- TRACKER LIST -->
@@ -135,10 +141,10 @@
       </div>
       <span id="trackerFilterCount" style="font-size:12px;color:var(--on-surface-medium);white-space:nowrap;margin:0 2px"></span>
       <div style="display:flex;gap:2px;align-items:center;border-left:1px solid var(--divider);padding-left:6px;margin-left:2px">
-        <button class="btn-icon" onclick="setAllActive(true)" data-tip="Activate all trackers" style="color:var(--on-surface-medium)">
+        <button class="btn-icon" onclick="setAllActive(true)" data-tip="Activate all WatchBots" style="color:var(--on-surface-medium)">
           <span class="material-icons" style="font-size:20px">play_circle</span>
         </button>
-        <button class="btn-icon" onclick="setAllActive(false)" data-tip="Deactivate all trackers" style="color:var(--on-surface-medium)">
+        <button class="btn-icon" onclick="setAllActive(false)" data-tip="Deactivate all WatchBots" style="color:var(--on-surface-medium)">
           <span class="material-icons" style="font-size:20px">pause_circle</span>
         </button>
         <button class="btn-icon" onclick="invertAll()" data-tip="Invert active states" style="color:var(--on-surface-medium)">
@@ -151,18 +157,18 @@
       <div style="display:flex;gap:10px;align-items:center;border-left:1px solid var(--divider);padding-left:8px;margin-left:2px">
         <label style="display:flex;align-items:center;gap:5px;font-size:13px;color:var(--on-surface-medium);cursor:pointer;user-select:none">
           <input type="checkbox" id="showChangedOnlyChk" onchange="setShowChangedOnly(this.checked)" style="accent-color:var(--warning);width:15px;height:15px">
-          New only
+          Show unread
         </label>
         <button id="dismissAllBtn" onclick="dismissAll()" style="display:none;font-size:13px;padding:4px 10px;color:var(--warning)" class="btn btn-text" data-tip="Mark all changes as read">
           <span class="material-icons" style="font-size:15px;vertical-align:middle">done_all</span> Mark all read
         </button>
         <label style="display:flex;align-items:center;gap:5px;font-size:13px;color:var(--on-surface-medium);cursor:pointer;user-select:none">
           <input type="checkbox" id="showLockedOnlyChk" onchange="setShowLockedOnly(this.checked)" style="accent-color:#e65100;width:15px;height:15px">
-          Locked only
+          Show locked
         </label>
         <label style="display:flex;align-items:center;gap:5px;font-size:13px;color:var(--on-surface-medium);cursor:pointer;user-select:none">
           <input type="checkbox" id="showActiveOnlyChk" onchange="setShowActiveOnly(this.checked)" style="accent-color:var(--primary);width:15px;height:15px">
-          Active only
+          Show active
         </label>
         <label style="display:flex;align-items:center;gap:5px;font-size:13px;color:var(--on-surface-medium);cursor:pointer;user-select:none">
           <input type="checkbox" id="showAIOnlyChk" onchange="setShowAIOnly(this.checked)" style="accent-color:var(--primary);width:15px;height:15px">
@@ -182,6 +188,16 @@
 
   <div class="tracker-list" id="trackerList"></div>
 
+</div>
+
+<!-- MAINTENANCE OVERLAY -->
+<div class="maintenance-overlay" id="maintenanceOverlay" aria-hidden="true" role="alertdialog" aria-modal="true" aria-labelledby="maintTitle">
+  <div class="maintenance-dialog">
+    <span class="material-icons" style="font-size:48px;color:var(--on-surface-medium);margin-bottom:8px">engineering</span>
+    <h2 id="maintTitle" style="font-size:22px;font-weight:600;margin:0 0 10px">System Maintenance</h2>
+    <p style="font-size:14px;color:var(--on-surface-medium);margin:0 0 6px;text-align:center;line-height:1.6">Watchbot is currently undergoing scheduled maintenance.<br>Please check back soon &mdash; we&rsquo;ll be back shortly.</p>
+    <p id="maintChecking" style="font-size:12px;color:var(--on-surface-light);margin-top:18px">Checking for updates&hellip;</p>
+  </div>
 </div>
 
 <!-- AUTH OVERLAY -->
@@ -247,8 +263,11 @@
     <div class="admin-tabs">
       <button class="admin-tab active" data-tab="users"    onclick="switchAdminTab('users')">Users</button>
       <button class="admin-tab"        data-tab="trackers" onclick="switchAdminTab('trackers')">WatchBots</button>
+      <button class="admin-tab"        data-tab="settings" onclick="switchAdminTab('settings')">Settings</button>
     </div>
     <div class="admin-body">
+      <!-- Settings tab -->
+      <div id="adminSettingsTab" style="display:none"></div>
       <!-- Users tab -->
       <div id="adminUsersTab">
         <!-- Add user form -->
@@ -305,7 +324,7 @@
               <th>Username</th>
               <th>Email</th>
               <th>Role</th>
-              <th>Trackers</th>
+              <th>Bots</th>
               <th>Limit</th>
               <th>Status</th>
               <th>Joined</th>
@@ -389,7 +408,7 @@
     </div>
 
     <div class="profile-section">
-      <div class="profile-section-title">Tracker limit</div>
+      <div class="profile-section-title">WatchBot limit</div>
       <div style="display:flex;align-items:center;gap:10px">
         <input type="number" id="editUserLimit" min="0" placeholder="Unlimited"
           style="width:120px;padding:9px 12px;border:1px solid var(--divider);border-radius:10px;font-size:14px;background:var(--surface);color:var(--on-surface)" />
@@ -455,6 +474,26 @@
       <p class="profile-msg" id="profilePwMsg"></p>
       <button class="btn btn-primary" style="width:100%;justify-content:center" onclick="saveProfilePassword()">Change password</button>
     </div>
+    <div class="profile-divider"></div>
+
+    <!-- Panel visibility -->
+    <div class="profile-section">
+      <div class="profile-section-title">Panel visibility</div>
+      <label class="toggle-switch" style="font-size:14px;color:var(--on-surface)">
+        <input type="checkbox" id="profileHideAiFinder" onchange="saveProfilePanelPref('hideAiFinder', this.checked)">
+        <span class="toggle-track"></span>
+        Hide AI Resource Finder
+      </label>
+      <p style="font-size:12px;color:var(--on-surface-medium);margin:0">Hides the AI Resource Finder panel from your dashboard.</p>
+      <div class="profile-divider" style="margin:10px 0"></div>
+      <label class="toggle-switch" style="font-size:14px;color:var(--on-surface)">
+        <input type="checkbox" id="profileHideAddTracker" onchange="saveProfilePanelPref('hideAddTracker', this.checked)">
+        <span class="toggle-track"></span>
+        Hide Watch a new resource
+      </label>
+      <p style="font-size:12px;color:var(--on-surface-medium);margin:0">Hides the &ldquo;Watch a new resource&rdquo; form from your dashboard.</p>
+    </div>
+
     <div class="profile-divider"></div>
 
     <!-- Notifications -->
@@ -526,7 +565,7 @@
       <div class="confirm-icon" style="background:var(--primary-light);color:var(--primary)">
         <span class="material-icons">tune</span>
       </div>
-      <h3 class="confirm-title" id="toModalTitle">Add Trackers</h3>
+      <h3 class="confirm-title" id="toModalTitle">Add WatchBots</h3>
     </div>
     <p class="confirm-message" id="toModalMessage"></p>
     <div class="field" style="margin-bottom:14px">
@@ -559,7 +598,7 @@
       <button type="button" class="btn btn-text" onclick="closeTrackerOptionsModal(false)">Cancel</button>
       <button type="button" class="btn btn-primary" id="toConfirmBtn" onclick="closeTrackerOptionsModal(true)">
         <span class="material-icons" style="font-size:17px">add_circle</span>
-        <span id="toConfirmLabel">Add Trackers</span>
+        <span id="toConfirmLabel">Add WatchBots</span>
       </button>
     </div>
   </div>
