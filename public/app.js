@@ -1052,8 +1052,8 @@ async function openProfile() {
     const cfgRes = await fetch('/api/auth/email-configured');
     if (cfgRes.ok) {
       const { configured } = await cfgRes.json();
-      const btn = document.getElementById('testEmailBtn');
-      if (btn) btn.style.display = configured ? '' : 'none';
+      const row = document.getElementById('testEmailRow');
+      if (row) row.style.display = configured ? 'flex' : 'none';
     }
   } catch {}
 
@@ -1156,10 +1156,15 @@ function sendTestNotification() {
 }
 
 async function sendTestEmail() {
-  const btn = document.getElementById('testEmailBtn');
+  const btn   = document.getElementById('testEmailBtn');
+  const plain = document.getElementById('testEmailPlainChk')?.checked ?? false;
   if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
   try {
-    const res  = await fetch('/api/auth/test-email', { method: 'POST' });
+    const res  = await fetch('/api/auth/test-email', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ plain }),
+    });
     const data = await res.json();
     if (res.ok) {
       showSnackbar('✓ Test email sent — check your inbox.');
@@ -1875,6 +1880,50 @@ async function dismissAll() {
     const chk = document.getElementById('showChangedOnlyChk');
     if (chk) chk.checked = false;
     renderTrackers();
+  }
+}
+
+let _markAllReadResolver = null;
+let _markAllReadKeyHandler = null;
+
+function confirmMarkAllRead() {
+  const changed = trackers.filter(t => t.status === 'changed');
+  if (!changed.length) return;
+  const modal = document.getElementById('markAllReadModal');
+  const cancelBtn = document.getElementById('markAllReadCancelBtn');
+  const confirmBtn = document.getElementById('markAllReadConfirmBtn');
+  if (!modal || !cancelBtn || !confirmBtn) { dismissAll(); return; }
+  if (_markAllReadResolver) _closeMarkAllReadModal(false);
+  modal.classList.add('show');
+  modal.setAttribute('aria-hidden', 'false');
+  document.body.classList.add('modal-open');
+  new Promise(resolve => {
+    _markAllReadResolver = resolve;
+    cancelBtn.onclick  = () => _closeMarkAllReadModal(false);
+    confirmBtn.onclick = () => _closeMarkAllReadModal(true);
+    modal.onclick = (e) => { if (e.target === modal) _closeMarkAllReadModal(false); };
+    _markAllReadKeyHandler = (e) => { if (e.key === 'Escape') _closeMarkAllReadModal(false); };
+    document.addEventListener('keydown', _markAllReadKeyHandler);
+    setTimeout(() => cancelBtn.focus(), 0);
+  }).then(confirmed => { if (confirmed) dismissAll(); });
+}
+
+function _closeMarkAllReadModal(confirmed) {
+  const modal = document.getElementById('markAllReadModal');
+  if (modal) {
+    modal.classList.remove('show');
+    modal.setAttribute('aria-hidden', 'true');
+    modal.onclick = null;
+  }
+  document.body.classList.remove('modal-open');
+  if (_markAllReadKeyHandler) {
+    document.removeEventListener('keydown', _markAllReadKeyHandler);
+    _markAllReadKeyHandler = null;
+  }
+  if (_markAllReadResolver) {
+    const resolve = _markAllReadResolver;
+    _markAllReadResolver = null;
+    resolve(confirmed);
   }
 }
 
@@ -2717,6 +2766,9 @@ function closeConfirmDialog(confirmed) {
 // ─── GLOBAL ESCAPE KEY ────────────────────────────────────────────────────────
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
+  if (document.getElementById('markAllReadModal')?.classList.contains('show')) {
+    _closeMarkAllReadModal(false); return;
+  }
   if (document.getElementById('trackerOptionsModal')?.classList.contains('show')) {
     closeTrackerOptionsModal(false); return;
   }

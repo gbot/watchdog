@@ -419,16 +419,16 @@ async function sendChangeEmail(tracker, summary, owner) {
   const from    = process.env.SES_FROM || 'Watchbot <noreply@example.com>';
   const dateStr = new Date().toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' });
   const html = `
-<div style="font-family:system-ui,sans-serif;max-width:600px;margin:0 auto;color:#1a1a1a">
-  <div style="background:#6200ea;padding:20px 24px;border-radius:8px 8px 0 0">
-    <span style="color:#fff;font-size:18px;font-weight:600">&#128276; Watchbot — Change Detected</span>
+<div style="font-family:'DM Sans',system-ui,-apple-system,sans-serif;max-width:600px;margin:0 auto;color:#202124">
+  <div style="background:#1a73e8;padding:20px 24px;border-radius:12px 12px 0 0">
+    <span style="color:#fff;font-size:18px;font-weight:500">&#128276; Watch<strong style="font-weight:700">bot</strong> &mdash; Change Detected</span>
   </div>
-  <div style="border:1px solid #e0e0e0;border-top:none;padding:24px;border-radius:0 0 8px 8px">
-    <p style="margin:0 0 8px"><strong>WatchBot:</strong> ${tracker.label.replace(/</g,'&lt;')}</p>
-    <p style="margin:0 0 16px"><strong>URL:</strong> <a href="${tracker.url}">${tracker.url.replace(/</g,'&lt;')}</a></p>
-    <p style="margin:0 0 8px;font-weight:600">Summary</p>
-    <div style="background:#f5f5f5;padding:12px 16px;border-radius:6px;font-size:14px;line-height:1.6">${summary.replace(/</g,'&lt;').replace(/\n/g,'<br>')}</div>
-    <p style="margin:16px 0 0;font-size:12px;color:#757575">Detected at ${dateStr}</p>
+  <div style="background:#ffffff;border:1px solid #e0e0e0;border-top:none;padding:24px;border-radius:0 0 12px 12px">
+    <p style="margin:0 0 4px;font-size:18px;font-weight:600;color:#202124">${tracker.label.replace(/</g,'&lt;')}</p>
+    <p style="margin:0 0 20px;font-size:13px;color:#5f6368"><a href="${tracker.url}" style="color:#1a73e8;text-decoration:none">${tracker.url.replace(/</g,'&lt;')}</a></p>
+    <p style="margin:0 0 8px;font-size:13px;font-weight:600;color:#202124">Summary</p>
+    <div style="background:#f1f3f4;padding:12px 16px;border-radius:8px;border-left:3px solid #1a73e8;font-size:14px;line-height:1.6;color:#202124">${summary.replace(/</g,'&lt;').replace(/\n/g,'<br>')}</div>
+    <p style="margin:16px 0 0;font-size:12px;color:#9aa0a6">Detected at ${dateStr}</p>
   </div>
 </div>`;
   const text = `Watchbot — Change Detected\n\nWatchBot: ${tracker.label}\nURL: ${tracker.url}\n\nSummary:\n${summary}\n\nDetected at ${dateStr}`;
@@ -1119,16 +1119,33 @@ app.post('/api/auth/test-email', authMiddleware, async (req, res) => {
   if (!user?.email)
     return res.status(400).json({ error: 'No email address on your account.' });
 
+  const plain   = req.body?.plain === true;
   const from    = process.env.SES_FROM || 'Watchbot <noreply@example.com>';
+  const dateStr = new Date().toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' });
+  const textBody = `Watchbot — Test Email\n\nThis is a test notification from Watchbot.\nEmail notifications are working correctly.\n\nSent at ${dateStr}`;
+  const htmlBody = `
+<div style="font-family:'DM Sans',system-ui,-apple-system,sans-serif;max-width:600px;margin:0 auto;color:#202124">
+  <div style="background:#1a73e8;padding:20px 24px;border-radius:12px 12px 0 0">
+    <span style="color:#fff;font-size:18px;font-weight:500">&#128276; Watch<strong style="font-weight:700">bot</strong> &mdash; Test Email</span>
+  </div>
+  <div style="background:#ffffff;border:1px solid #e0e0e0;border-top:none;padding:24px;border-radius:0 0 12px 12px">
+    <p style="margin:0 0 4px;font-size:18px;font-weight:600;color:#202124">Email notifications are working!</p>
+    <p style="margin:0 0 20px;font-size:13px;color:#5f6368">This is a test notification sent from your Watchbot account settings.</p>
+    <div style="background:#f1f3f4;padding:12px 16px;border-radius:8px;border-left:3px solid #1a73e8;font-size:14px;line-height:1.6;color:#202124">If you received this email, your notification settings are correctly configured. You will receive an email like this whenever a tracked resource changes.</div>
+    <p style="margin:16px 0 0;font-size:12px;color:#9aa0a6">Sent at ${dateStr}</p>
+  </div>
+</div>`;
+
+  const bodyPayload = plain
+    ? { Text: { Data: textBody, Charset: 'UTF-8' } }
+    : { Html: { Data: htmlBody, Charset: 'UTF-8' }, Text: { Data: textBody, Charset: 'UTF-8' } };
+
   const command = new SendEmailCommand({
     Source: from,
     Destination: { ToAddresses: [user.email] },
     Message: {
       Subject: { Data: 'Watchbot — test email', Charset: 'UTF-8' },
-      Body: {
-        Text: { Data: 'This is a test email from Watchbot. Email notifications are working correctly.', Charset: 'UTF-8' },
-        Html: { Data: '<p style="font-family:system-ui,sans-serif">This is a test email from <strong>Watchbot</strong>. Email notifications are working correctly.</p>', Charset: 'UTF-8' },
-      },
+      Body: bodyPayload,
     },
   });
   try {
