@@ -1683,9 +1683,16 @@ const MAX_PROFILES = 10;
 const MAX_PROFILE_NAME_LENGTH = 50;
 
 app.get('/api/profiles', authMiddleware, (req, res) => {
-  const profiles = db.prepare(
-    'SELECT id, userId, name, isDefault, createdAt FROM profiles WHERE userId = ? ORDER BY createdAt ASC'
-  ).all(req.userId);
+  const profiles = db.prepare(`
+    SELECT p.id, p.userId, p.name, p.isDefault, p.createdAt,
+           COALESCE(tc.trackerCount, 0) AS trackerCount
+    FROM profiles p
+    LEFT JOIN (
+      SELECT profileId, COUNT(*) AS trackerCount FROM trackers GROUP BY profileId
+    ) tc ON tc.profileId = p.id
+    WHERE p.userId = ?
+    ORDER BY p.createdAt ASC
+  `).all(req.userId);
   res.json(profiles.map(p => ({ ...p, isDefault: p.isDefault === 1 })));
 });
 

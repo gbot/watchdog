@@ -1643,7 +1643,7 @@ function renderProfilesDialog() {
 
   list.innerHTML = profiles.map(p => {
     const isActive = p.id === activeProfileId;
-    const trackerCount = trackers.filter(t => t.profileId === p.id).length;
+    const trackerCount = p.trackerCount ?? 0;
     return `
       <div class="profile-item${isActive ? ' profile-item-active' : ''}" data-profile-id="${escHtml(p.id)}">
         <div class="profile-item-info">
@@ -1729,7 +1729,7 @@ async function renameProfilePrompt(profileId) {
 async function deleteProfileConfirm(profileId) {
   const profile = profiles.find(p => p.id === profileId);
   if (!profile) return;
-  const trackerCount = trackers.filter(t => t.profileId === profileId).length;
+  const trackerCount = profile.trackerCount ?? 0;
   const moveSuffix = trackerCount > 0
     ? ` — ${trackerCount} WatchBot${trackerCount !== 1 ? 's' : ''} will be moved to Default`
     : '';
