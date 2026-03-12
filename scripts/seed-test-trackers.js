@@ -8,7 +8,7 @@
  *   node scripts/seed-test-trackers.js [--user <username>] [--count <n>]
  *
  * Options:
- *   --user <username>   Assign trackers to this user (default: wpnadmin)
+ *   --user <username>   Assign trackers to this user (default: admin)
  *   --count <n>         Number of trackers to create, max 65 (default: 50)
  *
  * Safe to re-run — duplicate URLs for the same user are skipped.
@@ -26,7 +26,7 @@ const Database  = require('better-sqlite3');
 
 // ─── CLI ARGS ─────────────────────────────────────────────────────────────────
 const args     = process.argv.slice(2);
-const userArg  = args[args.indexOf('--user')  + 1] || 'wpnadmin';
+const userArg  = args[args.indexOf('--user')  + 1] || 'admin';
 const countArg = parseInt(args[args.indexOf('--count') + 1]) || 50;
 
 // ─── POPULAR URLs ─────────────────────────────────────────────────────────────

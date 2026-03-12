@@ -20,7 +20,45 @@ const PORT = process.env.PORT || 3000;
 const JWT_SECRET    = process.env.JWT_SECRET || 'watchbot-fallback-secret-change-in-production';
 const COOKIE_MAX_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days
 
-app.use(cors({ origin: true, credentials: true }));
+function _normalizeOrigin(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  try {
+    const u = new URL(raw);
+    return `${u.protocol}//${u.host}`;
+  } catch {
+    return null;
+  }
+}
+
+const CORS_ALLOWLIST = (() => {
+  const configured = String(process.env.CORS_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(_normalizeOrigin)
+    .filter(Boolean);
+
+  const defaults = (process.env.NODE_ENV || 'development') !== 'production'
+    ? [
+        _normalizeOrigin(`http://localhost:${PORT}`),
+        _normalizeOrigin(`http://127.0.0.1:${PORT}`),
+      ].filter(Boolean)
+    : [];
+
+  return Array.from(new Set([...defaults, ...configured]));
+})();
+
+const _corsAllowSet = new Set(CORS_ALLOWLIST);
+
+app.use(cors({
+  credentials: true,
+  origin(origin, cb) {
+    // Requests without Origin are non-browser/server-to-server and are allowed.
+    // Browser cross-origin requests must match the explicit allowlist.
+    if (!origin) return cb(null, true);
+    const normalized = _normalizeOrigin(origin);
+    return cb(null, !!normalized && _corsAllowSet.has(normalized));
+  },
+}));
 app.use(express.json());
 app.use(cookieParser());
 app.use(express.static(path.join(__dirname, '../public')));
@@ -34,6 +72,35 @@ const _c = {
 function log(symbol, color, msg) {
   const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
   process.stdout.write(`${_c.dim}${ts}${_c.r}  ${color}${symbol}${_c.r}  ${msg}\n`);
+}
+
+function gravatarUrl(email, size = 64) {
+  const clean = (email || '').trim().toLowerCase();
+  if (!clean) return null;
+  const s = Math.min(Math.max(parseInt(size) || 64, 16), 512);
+  const hash = crypto.createHash('md5').update(clean).digest('hex');
+  return `https://www.gravatar.com/avatar/${hash}?s=${s}&d=mp&r=g`;
+}
+
+const PASSWORD_POLICY = Object.freeze({
+  minLength: 10,
+  upper: /[A-Z]/,
+  lower: /[a-z]/,
+  number: /\d/,
+  symbol: /[^A-Za-z0-9]/,
+});
+
+function passwordPolicyError(password, fieldLabel = 'Password') {
+  if (typeof password !== 'string' || !password.length)
+    return `${fieldLabel} is required`;
+  const valid =
+    password.length >= PASSWORD_POLICY.minLength &&
+    PASSWORD_POLICY.upper.test(password) &&
+    PASSWORD_POLICY.lower.test(password) &&
+    PASSWORD_POLICY.number.test(password) &&
+    PASSWORD_POLICY.symbol.test(password);
+  if (valid) return null;
+  return `${fieldLabel} must be at least ${PASSWORD_POLICY.minLength} characters and include uppercase, lowercase, a number, and a symbol`;
 }
 
 // ─── CLAUDE MODEL RESOLVER ────────────────────────────────────────────────────
@@ -53,8 +120,9 @@ const _modelAliases = {
   'haiku3.5':   'claude-3-5-haiku-20241022',
 };
 const CLAUDE_MODEL = (() => {
-  const raw = (process.env.CLAUDE_MODEL || 'sonnet-4').trim().toLowerCase();
-  return _modelAliases[raw] || process.env.CLAUDE_MODEL.trim();
+  const rawInput = process.env.CLAUDE_MODEL || 'sonnet-4';
+  const raw = rawInput.trim().toLowerCase();
+  return _modelAliases[raw] || rawInput.trim();
 })();
 log('✦', _c.magenta, `Claude model: ${CLAUDE_MODEL}`);
 
@@ -79,6 +147,7 @@ try { db.exec('ALTER TABLE users ADD COLUMN globalEmailNotify   INTEGER NOT NULL
 try { db.exec('ALTER TABLE users ADD COLUMN hideAiFinder        INTEGER NOT NULL DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN hideAddTracker      INTEGER NOT NULL DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN changesMaxHeight    INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE users ADD COLUMN emailVerified      INTEGER NOT NULL DEFAULT 0'); } catch {}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
@@ -87,7 +156,8 @@ db.exec(`
     passwordHash TEXT NOT NULL,
     createdAt    TEXT NOT NULL,
     email        TEXT,
-    role         TEXT NOT NULL DEFAULT 'user'
+    role         TEXT NOT NULL DEFAULT 'user',
+    emailVerified INTEGER NOT NULL DEFAULT 0
   );
 
   CREATE TABLE IF NOT EXISTS trackers (
@@ -127,6 +197,16 @@ db.exec(`
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS auth_tokens (
+    id        TEXT PRIMARY KEY,
+    userId    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    type      TEXT NOT NULL,
+    tokenHash TEXT NOT NULL UNIQUE,
+    expiresAt TEXT NOT NULL,
+    used      INTEGER NOT NULL DEFAULT 0,
+    createdAt TEXT NOT NULL
+  );
 `);
 
 // Migrations for existing DBs
@@ -135,9 +215,11 @@ try { db.prepare('ALTER TABLE changes ADD COLUMN locked   INTEGER DEFAULT 0').ru
 try { db.prepare('ALTER TABLE changes ADD COLUMN flagged  INTEGER DEFAULT 0').run(); } catch {}
 try { db.prepare('UPDATE changes SET flagged = locked WHERE locked = 1 AND flagged = 0').run(); } catch {}
 try { db.prepare('ALTER TABLE changes ADD COLUMN soft      INTEGER DEFAULT 0').run(); } catch {}
-try { db.prepare('ALTER TABLE changes ADD COLUMN snippet   TEXT').run(); } catch {}
+try { db.prepare('ALTER TABLE changes ADD COLUMN snippet           TEXT').run(); } catch {}
+try { db.prepare('ALTER TABLE changes ADD COLUMN aiDisabledReason   TEXT').run(); } catch {}
 try { db.prepare('ALTER TABLE trackers ADD COLUMN emailNotify INTEGER DEFAULT 0').run(); } catch {}
 try { db.prepare('ALTER TABLE trackers ADD COLUMN faviconUrl TEXT').run(); } catch {}
+try { db.exec('ALTER TABLE users ADD COLUMN disableAiSummary INTEGER NOT NULL DEFAULT 0'); } catch {}
 
 // ─── SITE SETTINGS HELPERS ───────────────────────────────────────────────────
 function getSetting(key, defaultVal = null) {
@@ -153,6 +235,8 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_changes_trackerId  ON changes(trackerId);
   CREATE INDEX IF NOT EXISTS idx_changes_detectedAt ON changes(detectedAt);
   CREATE INDEX IF NOT EXISTS idx_trackers_userId    ON trackers(userId);
+  CREATE INDEX IF NOT EXISTS idx_auth_tokens_user_type ON auth_tokens(userId, type, used);
+  CREATE INDEX IF NOT EXISTS idx_auth_tokens_expiry    ON auth_tokens(expiresAt);
 `);
 
 // Pre-compiled statements used in hot paths (parsed once, reused on every call)
@@ -263,13 +347,14 @@ function saveTrackers(list) {
 // Upserts only one row and broadcasts only to that user — avoids re-writing
 // every tracker and running orphan-cleanup queries on each check.
 function _saveOneTracker(tracker) {
+  const position = trackers.findIndex(t => t.id === tracker.id);
   _upsertTracker.run({
     ...tracker,
     active:        tracker.active       ? 1 : 0,
     aiSummary:     tracker.aiSummary === false ? 0 : 1,
     emailNotify:   tracker.emailNotify  ? 1 : 0,
     changeSnippet: tracker.changeSnippet ? JSON.stringify(tracker.changeSnippet) : null,
-    position:      trackers.indexOf(tracker),
+    position:      position >= 0 ? position : 0,
   });
   const userTrackers = trackers.filter(t => t.userId === tracker.userId);
   broadcastToUser(
@@ -353,9 +438,9 @@ function _isMinorTextChange(oldText, newText) {
 function saveChange(change) {
   const snippetJson = change.snippet ? JSON.stringify(change.snippet) : null;
   db.prepare(`
-    INSERT INTO changes (id, trackerId, trackerLabel, url, detectedAt, summary, oldHash, newHash, dismissed, soft, snippet)
-    VALUES (@id, @trackerId, @trackerLabel, @url, @detectedAt, @summary, @oldHash, @newHash, @dismissed, @soft, @snippet)
-  `).run({ dismissed: 0, soft: 0, snippet: null, ...change, snippet: snippetJson });
+    INSERT INTO changes (id, trackerId, trackerLabel, url, detectedAt, summary, oldHash, newHash, dismissed, soft, snippet, aiDisabledReason)
+    VALUES (@id, @trackerId, @trackerLabel, @url, @detectedAt, @summary, @oldHash, @newHash, @dismissed, @soft, @snippet, @aiDisabledReason)
+  `).run({ dismissed: 0, soft: 0, snippet: null, aiDisabledReason: null, ...change, snippet: snippetJson });
   // Only prune when the unflagged pool actually exceeds the cap — avoids a
   // redundant DELETE subquery scan on every save when well under the limit.
   const cap = Math.max(parseInt(getSetting('historyRetentionCap', '500') || '500'), 10);
@@ -386,16 +471,19 @@ let trackers = loadTrackers();
 
 // ─── SEED ADMIN ─────────────────────────────────────────────────────────────
 (async () => {
-  const existing = db.prepare('SELECT id FROM users WHERE username = ?').get('wpnadmin');
-  if (!existing) {
-    const hash = await bcrypt.hash('vladimir', 12);
-    db.prepare(`INSERT INTO users (id, username, passwordHash, createdAt, role)
-                VALUES (?, 'wpnadmin', ?, ?, 'admin')`).
-      run(uuidv4(), hash, new Date().toISOString());
-    console.log('  ✓ Admin account created (wpnadmin)');
-  } else {
-    // Ensure the role is set correctly even if the account pre-existed
-    db.prepare('UPDATE users SET role = ? WHERE username = ?').run('admin', 'wpnadmin');
+  const existingDefault = db.prepare('SELECT id FROM users WHERE LOWER(username) = LOWER(?)').get('admin');
+  const hasAdminRole = db.prepare('SELECT id FROM users WHERE role = ? LIMIT 1').get('admin');
+  if (!hasAdminRole) {
+    if (existingDefault) {
+      db.prepare('UPDATE users SET role = ? WHERE id = ?').run('admin', existingDefault.id);
+      log('✓', _c.green, 'Existing "admin" user promoted to admin role');
+    } else {
+      const hash = await bcrypt.hash('Watchbot@2025!', 12);
+      db.prepare(`INSERT INTO users (id, username, passwordHash, createdAt, role)
+                  VALUES (?, 'admin', ?, ?, 'admin')`).
+        run(uuidv4(), hash, new Date().toISOString());
+      log('✓', _c.green, 'Admin account created (admin)');
+    }
   }
 })();
 
@@ -412,6 +500,142 @@ function _sesClient() {
       secretAccessKey: process.env.SES_SECRET_ACCESS_KEY,
     },
   });
+}
+
+const AUTH_TOKEN_TYPE_VERIFY_EMAIL = 'verify_email';
+const AUTH_TOKEN_TYPE_PASSWORD_RESET = 'password_reset';
+const EMAIL_VERIFY_TTL_MS = 24 * 60 * 60 * 1000;
+const PASSWORD_RESET_TTL_MS = 30 * 60 * 1000;
+
+function _hashToken(raw) {
+  return crypto.createHash('sha256').update(String(raw || '')).digest('hex');
+}
+
+function _pruneAuthTokens() {
+  const nowIso = new Date().toISOString();
+  db.prepare('DELETE FROM auth_tokens WHERE used = 1 OR expiresAt < ?').run(nowIso);
+}
+
+function _createAuthToken(userId, type, ttlMs) {
+  const raw = crypto.randomBytes(32).toString('hex');
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + ttlMs).toISOString();
+  db.prepare(`
+    INSERT INTO auth_tokens (id, userId, type, tokenHash, expiresAt, used, createdAt)
+    VALUES (?, ?, ?, ?, ?, 0, ?)
+  `).run(uuidv4(), userId, type, _hashToken(raw), expiresAt, now.toISOString());
+  _pruneAuthTokens();
+  return raw;
+}
+
+function _consumeAuthToken(type, rawToken) {
+  const token = String(rawToken || '').trim();
+  if (!token) return null;
+  const row = db.prepare(`
+    SELECT id, userId, expiresAt
+    FROM auth_tokens
+    WHERE type = ? AND tokenHash = ? AND used = 0
+  `).get(type, _hashToken(token));
+  if (!row) return null;
+  if (new Date(row.expiresAt).getTime() < Date.now()) {
+    db.prepare('UPDATE auth_tokens SET used = 1 WHERE id = ?').run(row.id);
+    return null;
+  }
+  db.prepare('UPDATE auth_tokens SET used = 1 WHERE id = ?').run(row.id);
+  return row;
+}
+
+function _invalidateAuthTokens(userId, type) {
+  db.prepare('UPDATE auth_tokens SET used = 1 WHERE userId = ? AND type = ?').run(userId, type);
+}
+
+function _authBaseUrl(req) {
+  const envBase = (process.env.APP_BASE_URL || '').trim();
+  if (envBase) return envBase.replace(/\/$/, '');
+  const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'http').toString().split(',')[0].trim();
+  return `${proto}://${req.get('host')}`;
+}
+
+function _authActionLink(req, action, token) {
+  return `${_authBaseUrl(req)}/?action=${encodeURIComponent(action)}&token=${encodeURIComponent(token)}`;
+}
+
+async function _sendAccountEmail(toEmail, subject, textBody, htmlBody) {
+  const from = process.env.SES_FROM || 'Watchbot <noreply@example.com>';
+  const command = new SendEmailCommand({
+    Source: from,
+    Destination: { ToAddresses: [toEmail] },
+    Message: {
+      Subject: { Data: subject, Charset: 'UTF-8' },
+      Body: {
+        Html: { Data: htmlBody, Charset: 'UTF-8' },
+        Text: { Data: textBody, Charset: 'UTF-8' },
+      },
+    },
+  });
+  await _sesClient().send(command);
+}
+
+async function sendEmailVerificationEmail(user, req) {
+  if (!_isSesConfigured() || !user?.email) return false;
+  _invalidateAuthTokens(user.id, AUTH_TOKEN_TYPE_VERIFY_EMAIL);
+  const token = _createAuthToken(user.id, AUTH_TOKEN_TYPE_VERIFY_EMAIL, EMAIL_VERIFY_TTL_MS);
+  const verifyLink = _authActionLink(req, 'verify-email', token);
+  const displayName = (user.username || 'there').replace(/</g, '&lt;');
+  const textBody = `Watchbot — Verify your email\n\nHi ${user.username || 'there'},\n\nPlease verify your Watchbot email by opening this link:\n${verifyLink}\n\nThis link expires in 24 hours.`;
+  const htmlBody = `
+<div style="font-family:'DM Sans',system-ui,-apple-system,sans-serif;max-width:600px;margin:0 auto;color:#202124">
+  <div style="background:#1a73e8;padding:20px 24px;border-radius:12px 12px 0 0">
+    <span style="color:#fff;font-size:18px;font-weight:500">Verify your <strong style="font-weight:700">Watchbot</strong> email</span>
+  </div>
+  <div style="background:#ffffff;border:1px solid #e0e0e0;border-top:none;padding:24px;border-radius:0 0 12px 12px">
+    <p style="margin:0 0 8px;font-size:15px">Hi ${displayName},</p>
+    <p style="margin:0 0 16px;font-size:14px;color:#5f6368">Confirm your email address to keep your account secure and fully enabled.</p>
+    <p style="margin:0 0 18px"><a href="${verifyLink}" style="display:inline-block;background:#1a73e8;color:#fff;text-decoration:none;padding:10px 16px;border-radius:8px;font-size:14px">Verify email</a></p>
+    <p style="margin:0 0 8px;font-size:12px;color:#9aa0a6">Or paste this link into your browser:</p>
+    <p style="margin:0;font-size:12px;word-break:break-all;color:#5f6368">${verifyLink}</p>
+    <p style="margin:16px 0 0;font-size:12px;color:#9aa0a6">This link expires in 24 hours.</p>
+  </div>
+</div>`;
+  try {
+    await _sendAccountEmail(user.email, 'Watchbot — verify your email', textBody, htmlBody);
+    log('✉', _c.cyan, `Verification email sent → ${user.email}`);
+    return true;
+  } catch (err) {
+    log('✗', _c.red, `Verification email error: ${err.message}`);
+    return false;
+  }
+}
+
+async function sendPasswordResetEmail(user, req) {
+  if (!_isSesConfigured() || !user?.email) return false;
+  _invalidateAuthTokens(user.id, AUTH_TOKEN_TYPE_PASSWORD_RESET);
+  const token = _createAuthToken(user.id, AUTH_TOKEN_TYPE_PASSWORD_RESET, PASSWORD_RESET_TTL_MS);
+  const resetLink = _authActionLink(req, 'reset-password', token);
+  const displayName = (user.username || 'there').replace(/</g, '&lt;');
+  const textBody = `Watchbot — Reset password\n\nHi ${user.username || 'there'},\n\nUse this secure link to reset your password:\n${resetLink}\n\nThis link expires in 30 minutes. If you did not request this, you can ignore this email.`;
+  const htmlBody = `
+<div style="font-family:'DM Sans',system-ui,-apple-system,sans-serif;max-width:600px;margin:0 auto;color:#202124">
+  <div style="background:#1a73e8;padding:20px 24px;border-radius:12px 12px 0 0">
+    <span style="color:#fff;font-size:18px;font-weight:500">Reset your <strong style="font-weight:700">Watchbot</strong> password</span>
+  </div>
+  <div style="background:#ffffff;border:1px solid #e0e0e0;border-top:none;padding:24px;border-radius:0 0 12px 12px">
+    <p style="margin:0 0 8px;font-size:15px">Hi ${displayName},</p>
+    <p style="margin:0 0 16px;font-size:14px;color:#5f6368">A password reset was requested for your account.</p>
+    <p style="margin:0 0 18px"><a href="${resetLink}" style="display:inline-block;background:#1a73e8;color:#fff;text-decoration:none;padding:10px 16px;border-radius:8px;font-size:14px">Reset password</a></p>
+    <p style="margin:0 0 8px;font-size:12px;color:#9aa0a6">Or paste this link into your browser:</p>
+    <p style="margin:0;font-size:12px;word-break:break-all;color:#5f6368">${resetLink}</p>
+    <p style="margin:16px 0 0;font-size:12px;color:#9aa0a6">This link expires in 30 minutes. If you did not request it, you can ignore this message.</p>
+  </div>
+</div>`;
+  try {
+    await _sendAccountEmail(user.email, 'Watchbot — password reset', textBody, htmlBody);
+    log('✉', _c.cyan, `Password reset email sent → ${user.email}`);
+    return true;
+  } catch (err) {
+    log('✗', _c.red, `Password reset email error: ${err.message}`);
+    return false;
+  }
 }
 
 async function sendChangeEmail(tracker, summary, owner) {
@@ -723,22 +947,36 @@ async function checkTracker(tracker) {
         ? _isMinorTextChange(tracker.lastBody, structuredText)
         : false;
 
-      log('⚡', _c.yellow, `Changed   "${tracker.label}"  [HTTP ${status}]${
-        preflightSoft                  ? '  — minor diff, skipping AI' :
-        tracker.aiSummary === false    ? '' :
-                                         '  — fetching AI summary…'
-      }`);
+      const ownerPrefs = db.prepare(
+        'SELECT disableAiSummary, email, globalEmailNotify FROM users WHERE id = ?'
+      ).get(tracker.userId);
 
       let summary;
+      let aiDisabledReason = null;
+      let aiLogDetail = '';
       if (preflightSoft) {
         summary = 'No significant content changes detected.';
-      } else if (tracker.aiSummary === false) {
-        summary = 'Content changed. (AI summary disabled for this tracker)';
+        aiLogDetail = 'AI skipped (minor text diff preflight)';
       } else if (getSetting('aiEnabled', '1') === '0') {
-        summary = 'Content changed. (AI summary disabled globally)';
+        summary = 'Content changed.';
+        aiDisabledReason = 'admin';
+        aiLogDetail = 'AI skipped (disabled by Admin setting)';
       } else {
-        summary = await getChangeSummary(tracker.lastBody, structuredText, tracker.url);
+        if (ownerPrefs?.disableAiSummary === 1) {
+          summary = 'Content changed.';
+          aiDisabledReason = 'user';
+          aiLogDetail = 'AI skipped (disabled by User profile)';
+        } else if (tracker.aiSummary === false) {
+          summary = 'Content changed.';
+          aiDisabledReason = 'tracker';
+          aiLogDetail = 'AI skipped (disabled for this tracker)';
+        } else {
+          aiLogDetail = 'AI requested';
+          summary = await getChangeSummary(tracker.lastBody, structuredText, tracker.url);
+        }
       }
+
+      log('⚡', _c.yellow, `Changed   "${tracker.label}"  [HTTP ${status}]  — ${aiLogDetail}`);
 
       const soft    = preflightSoft || isSoftChange(summary);
       const snippet = computeDiffSnippet(tracker.lastBody || '', structuredText);
@@ -757,6 +995,7 @@ async function checkTracker(tracker) {
         url:          tracker.url,
         detectedAt:   now,
         summary,
+        aiDisabledReason,
         oldHash:      tracker.lastHash,
         newHash:      hash,
         dismissed:    soft ? 1 : 0,
@@ -771,9 +1010,8 @@ async function checkTracker(tracker) {
       // Fire email notification only for real (non-soft) changes,
       // and only when the user's global email toggle is enabled.
       if (!soft && tracker.emailNotify) {
-        const owner = db.prepare('SELECT email, globalEmailNotify FROM users WHERE id = ?').get(tracker.userId);
-        if (owner?.email && owner.globalEmailNotify !== 0) {
-          sendChangeEmail(tracker, summary, owner).catch(err =>
+        if (ownerPrefs?.email && ownerPrefs.globalEmailNotify !== 0) {
+          sendChangeEmail(tracker, summary, ownerPrefs).catch(err =>
             log('✗', _c.red, `Email error "${tracker.label}": ${err.message}`)
           );
         }
@@ -787,7 +1025,7 @@ async function checkTracker(tracker) {
         'SELECT COUNT(*) as c FROM changes WHERE trackerId = ? AND dismissed = 0'
       ).get(tracker.id).c;
       tracker.status = undismissed > 0 ? 'changed' : 'ok';
-      log('·', _c.dim, `No change "${tracker.label}"  [HTTP ${status}]`);
+      log('·', _c.dim, `No changes found "${tracker.label}"  [HTTP ${status}]${undismissed > 0 ? '  — unread changes still pending' : ''}`);
     }
 
   } catch (err) {
@@ -809,6 +1047,21 @@ async function checkTracker(tracker) {
 
   _saveOneTracker(tracker);
   return tracker;
+}
+
+// ─── USER INTERVAL OPTIONS ───────────────────────────────────────────────────
+// Default allowed intervals for non-admin users (matches former MIN_INTERVAL_USER
+// behaviour — hour and above). Admin can change this via the Settings panel.
+const _DEFAULT_USER_INTERVAL_OPTIONS = [3600000, 14400000, 21600000, 43200000, 86400000, 259200000, 604800000];
+
+function getUserAllowedIntervals() {
+  const stored = getSetting('userIntervalOptions', null);
+  if (!stored) return _DEFAULT_USER_INTERVAL_OPTIONS;
+  try {
+    const parsed = JSON.parse(stored);
+    if (Array.isArray(parsed) && parsed.length > 0) return parsed.map(Number);
+  } catch {}
+  return _DEFAULT_USER_INTERVAL_OPTIONS;
 }
 
 // ─── SCHEDULER ────────────────────────────────────────────────────────────────
@@ -930,8 +1183,9 @@ function adminMiddleware(req, res, next) {
 // ─── PUBLIC SETTINGS ENDPOINT ──────────────────────────────────────────────────
 app.get('/api/settings', (req, res) => {
   res.json({
-    allowRegistration: getSetting('allowRegistration', '1') !== '0',
-    maintenanceMode:   getSetting('maintenanceMode',   '0') === '1',
+    allowRegistration:   getSetting('allowRegistration', '1') !== '0',
+    maintenanceMode:     getSetting('maintenanceMode',   '0') === '1',
+    userIntervalOptions: getUserAllowedIntervals(),
   });
 });
 
@@ -946,10 +1200,11 @@ app.post('/api/auth/register', async (req, res) => {
     return res.status(400).json({ error: 'Email address is required' });
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()))
     return res.status(400).json({ error: 'Please enter a valid email address' });
-  if (username.trim().length < 3)
-    return res.status(400).json({ error: 'Username must be at least 3 characters' });
-  if (password.length < 6)
-    return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  if (username.trim().length < 2)
+    return res.status(400).json({ error: 'Username must be at least 2 characters' });
+  const registerPwError = passwordPolicyError(password, 'Password');
+  if (registerPwError)
+    return res.status(400).json({ error: registerPwError });
 
   const existingUsername = db.prepare('SELECT id FROM users WHERE LOWER(username) = LOWER(?)').get(username.trim());
   if (existingUsername) return res.status(409).json({ error: 'That username is already taken' });
@@ -961,32 +1216,127 @@ app.post('/api/auth/register', async (req, res) => {
     const g = parseInt(getSetting('defaultTrackerLimit', '0') || '0');
     return g > 0 ? g : null;
   })();
-  const user = { id: uuidv4(), username: username.trim(), email: email.trim().toLowerCase(), passwordHash, createdAt: new Date().toISOString() };
-  db.prepare('INSERT INTO users (id, username, email, passwordHash, createdAt, trackerLimit) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(user.id, user.username, user.email, user.passwordHash, user.createdAt, initLimit);
+  const user = { id: uuidv4(), username: username.trim(), email: email.trim().toLowerCase(), passwordHash, createdAt: new Date().toISOString(), emailVerified: 0 };
+  db.prepare('INSERT INTO users (id, username, email, passwordHash, createdAt, trackerLimit, emailVerified) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(user.id, user.username, user.email, user.passwordHash, user.createdAt, initLimit, user.emailVerified);
+
+  const verificationEmailSent = await sendEmailVerificationEmail(user, req);
 
   const token = jwt.sign({ userId: user.id, username: user.username, role: 'user' }, JWT_SECRET, { expiresIn: '7d' });
   res.cookie('watchbot_auth', token, { httpOnly: true, sameSite: 'lax', maxAge: COOKIE_MAX_AGE });
-  res.status(201).json({ id: user.id, username: user.username, role: 'user', notificationsEnabled: true });
+  res.status(201).json({
+    id: user.id,
+    username: user.username,
+    role: 'user',
+    notificationsEnabled: true,
+    hideAiFinder: false,
+    hideAddTracker: false,
+    changesMaxHeight: 0,
+    trackerLimit: initLimit,
+    disableAiSummary: false,
+    emailVerified: false,
+    verificationEmailSent,
+    gravatarUrl: gravatarUrl(user.email, 64),
+  });
+});
+
+app.post('/api/auth/forgot-password', async (req, res) => {
+  const generic = 'If an account exists for that email, a reset link has been sent.';
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.json({ success: true, message: generic });
+  }
+
+  const user = db.prepare('SELECT id, username, email, disabled FROM users WHERE LOWER(email) = LOWER(?)').get(email);
+  if (!user || user.disabled) {
+    return res.json({ success: true, message: generic });
+  }
+
+  if (!_isSesConfigured()) {
+    log('~', _c.dim, `Password reset requested for ${email}, but SES is not configured.`);
+    return res.json({ success: true, message: generic });
+  }
+
+  await sendPasswordResetEmail(user, req);
+  return res.json({ success: true, message: generic });
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  const token = req.body?.token;
+  const newPassword = req.body?.newPassword;
+  const newPwError = passwordPolicyError(newPassword, 'New password');
+  if (newPwError) return res.status(400).json({ error: newPwError });
+
+  const consumed = _consumeAuthToken(AUTH_TOKEN_TYPE_PASSWORD_RESET, token);
+  if (!consumed) {
+    return res.status(400).json({ error: 'Reset link is invalid or has expired.' });
+  }
+
+  const user = db.prepare('SELECT id FROM users WHERE id = ?').get(consumed.userId);
+  if (!user) return res.status(400).json({ error: 'Reset link is invalid or has expired.' });
+
+  const hash = await bcrypt.hash(newPassword, 12);
+  db.prepare('UPDATE users SET passwordHash = ?, emailVerified = 1 WHERE id = ?').run(hash, consumed.userId);
+  _invalidateAuthTokens(consumed.userId, AUTH_TOKEN_TYPE_PASSWORD_RESET);
+  _invalidateAuthTokens(consumed.userId, AUTH_TOKEN_TYPE_VERIFY_EMAIL);
+  res.json({ success: true });
+});
+
+app.post('/api/auth/verify-email', (req, res) => {
+  const token = req.body?.token;
+  const consumed = _consumeAuthToken(AUTH_TOKEN_TYPE_VERIFY_EMAIL, token);
+  if (!consumed) {
+    return res.status(400).json({ error: 'Verification link is invalid or has expired.' });
+  }
+  db.prepare('UPDATE users SET emailVerified = 1 WHERE id = ?').run(consumed.userId);
+  _invalidateAuthTokens(consumed.userId, AUTH_TOKEN_TYPE_VERIFY_EMAIL);
+  res.json({ success: true });
 });
 
 app.post('/api/auth/login', async (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password)
-    return res.status(400).json({ error: 'Username and password are required' });
+  const identifierRaw = req.body?.identifier ?? req.body?.username ?? req.body?.email;
+  const identifier = typeof identifierRaw === 'string' ? identifierRaw.trim() : '';
+  const password = req.body?.password;
+  if (!identifier || !password)
+    return res.status(400).json({ error: 'Email or username and password are required' });
 
-  const users = loadUsers();
-  const user  = users.find(u => u.username.toLowerCase() === username.toLowerCase());
-  if (!user) return res.status(401).json({ error: 'Invalid username or password' });
+  const lookup = identifier.toLowerCase();
+  const preferEmail = identifier.includes('@');
+  const user = preferEmail
+    ? db.prepare(`
+        SELECT * FROM users
+        WHERE LOWER(email) = ? OR LOWER(username) = ?
+        ORDER BY CASE WHEN LOWER(email) = ? THEN 0 ELSE 1 END
+        LIMIT 1
+      `).get(lookup, lookup, lookup)
+    : db.prepare(`
+        SELECT * FROM users
+        WHERE LOWER(username) = ? OR LOWER(email) = ?
+        ORDER BY CASE WHEN LOWER(username) = ? THEN 0 ELSE 1 END
+        LIMIT 1
+      `).get(lookup, lookup, lookup);
+  if (!user) return res.status(401).json({ error: 'Invalid email/username or password' });
 
   const ok = await bcrypt.compare(password, user.passwordHash);
-  if (!ok) return res.status(401).json({ error: 'Invalid username or password' });
+  if (!ok) return res.status(401).json({ error: 'Invalid email/username or password' });
 
   if (user.disabled) return res.status(403).json({ error: 'Your account has been deactivated. Please contact an administrator.' });
 
   const token = jwt.sign({ userId: user.id, username: user.username, role: user.role || 'user' }, JWT_SECRET, { expiresIn: '7d' });
   res.cookie('watchbot_auth', token, { httpOnly: true, sameSite: 'lax', maxAge: COOKIE_MAX_AGE });
-  res.json({ id: user.id, username: user.username, role: user.role || 'user', notificationsEnabled: user.notificationsEnabled !== 0 });
+  res.json({
+    id: user.id,
+    username: user.username,
+    role: user.role || 'user',
+    notificationsEnabled: user.notificationsEnabled !== 0,
+    hideAiFinder: user.hideAiFinder === 1,
+    hideAddTracker: user.hideAddTracker === 1,
+    changesMaxHeight: user.changesMaxHeight || 0,
+    trackerLimit: user.trackerLimit ?? null,
+    disableAiSummary: user.disableAiSummary === 1,
+    emailVerified: user.emailVerified === 1,
+    gravatarUrl: gravatarUrl(user.email, 64),
+  });
 });
 
 app.post('/api/auth/logout', (req, res) => {
@@ -1005,17 +1355,20 @@ app.get('/api/auth/me', (req, res) => {
   }
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const user = db.prepare('SELECT role, disabled, notificationsEnabled, hideAiFinder, hideAddTracker, changesMaxHeight, trackerLimit FROM users WHERE id = ?').get(payload.userId);
+    const user = db.prepare('SELECT username, role, email, emailVerified, disabled, notificationsEnabled, hideAiFinder, hideAddTracker, changesMaxHeight, trackerLimit, disableAiSummary FROM users WHERE id = ?').get(payload.userId);
     if (!user || user.disabled) return res.status(401).json({ error: 'Not authenticated' });
     const role = user.role || 'user';
     if (getSetting('maintenanceMode', '0') === '1' && role !== 'admin')
       return res.status(503).json({ error: 'System maintenance in progress.' });
-    res.json({ id: payload.userId, username: payload.username, role,
+    res.json({ id: payload.userId, username: user.username || payload.username, role,
       notificationsEnabled: user.notificationsEnabled !== 0,
       hideAiFinder:         user.hideAiFinder  === 1,
       hideAddTracker:       user.hideAddTracker === 1,
       changesMaxHeight:     user.changesMaxHeight || 0,
       trackerLimit:         user.trackerLimit ?? null,
+      disableAiSummary:     user.disableAiSummary === 1,
+        emailVerified:        user.emailVerified === 1,
+      gravatarUrl:          gravatarUrl(user.email, 64),
       ...(payload.impersonatedBy ? { impersonatedBy: payload.impersonatedBy } : {}) });
   } catch {
     res.status(401).json({ error: 'Invalid or expired session' });
@@ -1023,15 +1376,18 @@ app.get('/api/auth/me', (req, res) => {
 });
 
 app.get('/api/auth/profile', authMiddleware, (req, res) => {
-  const user = db.prepare('SELECT id, username, email, createdAt, notificationsEnabled, globalEmailNotify, hideAiFinder, hideAddTracker, changesMaxHeight FROM users WHERE id = ?').get(req.userId);
+  const user = db.prepare('SELECT id, username, email, emailVerified, createdAt, notificationsEnabled, globalEmailNotify, hideAiFinder, hideAddTracker, changesMaxHeight, disableAiSummary FROM users WHERE id = ?').get(req.userId);
   if (!user) return res.status(404).json({ error: 'User not found' });
   res.json({
     ...user,
+    emailVerified:        user.emailVerified === 1,
     notificationsEnabled: user.notificationsEnabled !== 0,
     globalEmailNotify:    user.globalEmailNotify    !== 0,
     hideAiFinder:         user.hideAiFinder         === 1,
     hideAddTracker:       user.hideAddTracker        === 1,
     changesMaxHeight:     user.changesMaxHeight      || 0,
+    disableAiSummary:     user.disableAiSummary      === 1,
+    gravatarUrl:          gravatarUrl(user.email, 96),
   });
 });
 
@@ -1055,9 +1411,12 @@ app.delete('/api/auth/profile', authMiddleware, async (req, res) => {
 });
 
 app.patch('/api/auth/profile', authMiddleware, async (req, res) => {
-  const { email, currentPassword, newPassword } = req.body;
+  const { email, newPassword } = req.body;
+  let emailChanged = false;
+  const pending = {};
+  let nextPasswordHash = null;
 
-  if (email === undefined && newPassword === undefined && req.body.notificationsEnabled === undefined && req.body.globalEmailNotify === undefined && req.body.hideAiFinder === undefined && req.body.hideAddTracker === undefined && req.body.changesMaxHeight === undefined)
+  if (email === undefined && newPassword === undefined && req.body.username === undefined && req.body.notificationsEnabled === undefined && req.body.globalEmailNotify === undefined && req.body.hideAiFinder === undefined && req.body.hideAddTracker === undefined && req.body.changesMaxHeight === undefined && req.body.disableAiSummary === undefined)
     return res.status(400).json({ error: 'Nothing to update' });
 
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
@@ -1065,53 +1424,129 @@ app.patch('/api/auth/profile', authMiddleware, async (req, res) => {
 
   if (email !== undefined) {
     const trimmed = (email || '').trim();
+    if (!trimmed)
+      return res.status(400).json({ error: 'Email address is required' });
     if (trimmed && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed))
       return res.status(400).json({ error: 'Invalid email address' });
-    db.prepare('UPDATE users SET email = ? WHERE id = ?').run(trimmed || null, req.userId);
+    const conflict = db.prepare('SELECT id FROM users WHERE LOWER(email) = LOWER(?) AND id != ?').get(trimmed, req.userId);
+    if (conflict) return res.status(409).json({ error: 'An account with that email already exists' });
+    pending.email = trimmed.toLowerCase();
+    emailChanged = true;
+  }
+
+  if (req.body.username !== undefined) {
+    const trimmedUsername = String(req.body.username || '').trim();
+    if (trimmedUsername.length < 2)
+      return res.status(400).json({ error: 'Username must be at least 2 characters' });
+    const usernameConflict = db.prepare('SELECT id FROM users WHERE LOWER(username) = LOWER(?) AND id != ?').get(trimmedUsername, req.userId);
+    if (usernameConflict) return res.status(409).json({ error: 'That username is already taken' });
+    pending.username = trimmedUsername;
   }
 
   if (req.body.notificationsEnabled !== undefined) {
-    db.prepare('UPDATE users SET notificationsEnabled = ? WHERE id = ?')
-      .run(req.body.notificationsEnabled ? 1 : 0, req.userId);
+    pending.notificationsEnabled = req.body.notificationsEnabled ? 1 : 0;
   }
 
   if (req.body.globalEmailNotify !== undefined) {
-    db.prepare('UPDATE users SET globalEmailNotify = ? WHERE id = ?')
-      .run(req.body.globalEmailNotify ? 1 : 0, req.userId);
+    pending.globalEmailNotify = req.body.globalEmailNotify ? 1 : 0;
   }
 
   if (req.body.hideAiFinder !== undefined) {
-    db.prepare('UPDATE users SET hideAiFinder = ? WHERE id = ?')
-      .run(req.body.hideAiFinder ? 1 : 0, req.userId);
+    pending.hideAiFinder = req.body.hideAiFinder ? 1 : 0;
   }
 
   if (req.body.hideAddTracker !== undefined) {
-    db.prepare('UPDATE users SET hideAddTracker = ? WHERE id = ?')
-      .run(req.body.hideAddTracker ? 1 : 0, req.userId);
+    pending.hideAddTracker = req.body.hideAddTracker ? 1 : 0;
   }
 
   if (req.body.changesMaxHeight !== undefined) {
     const h = parseInt(req.body.changesMaxHeight) || 0;
-    db.prepare('UPDATE users SET changesMaxHeight = ? WHERE id = ?')
-      .run(h >= 100 ? h : 0, req.userId);
+    pending.changesMaxHeight = h >= 100 ? h : 0;
+  }
+
+  if (req.body.disableAiSummary !== undefined) {
+    pending.disableAiSummary = req.body.disableAiSummary ? 1 : 0;
   }
 
   if (newPassword !== undefined) {
-    if (!currentPassword)
-      return res.status(400).json({ error: 'Current password is required' });
-    const ok = await bcrypt.compare(currentPassword, user.passwordHash);
-    if (!ok) return res.status(401).json({ error: 'Current password is incorrect' });
-    if (newPassword.length < 6)
-      return res.status(400).json({ error: 'New password must be at least 6 characters' });
-    const hash = await bcrypt.hash(newPassword, 12);
-    db.prepare('UPDATE users SET passwordHash = ? WHERE id = ?').run(hash, req.userId);
+    const newPwError = passwordPolicyError(newPassword, 'New password');
+    if (newPwError)
+      return res.status(400).json({ error: newPwError });
+    nextPasswordHash = await bcrypt.hash(newPassword, 12);
   }
 
-  res.json({ success: true });
+  try {
+    db.transaction(() => {
+      if (pending.email !== undefined) {
+        db.prepare('UPDATE users SET email = ?, emailVerified = 0 WHERE id = ?').run(pending.email, req.userId);
+      }
+      if (pending.username !== undefined) {
+        db.prepare('UPDATE users SET username = ? WHERE id = ?').run(pending.username, req.userId);
+      }
+      if (pending.notificationsEnabled !== undefined) {
+        db.prepare('UPDATE users SET notificationsEnabled = ? WHERE id = ?').run(pending.notificationsEnabled, req.userId);
+      }
+      if (pending.globalEmailNotify !== undefined) {
+        db.prepare('UPDATE users SET globalEmailNotify = ? WHERE id = ?').run(pending.globalEmailNotify, req.userId);
+      }
+      if (pending.hideAiFinder !== undefined) {
+        db.prepare('UPDATE users SET hideAiFinder = ? WHERE id = ?').run(pending.hideAiFinder, req.userId);
+      }
+      if (pending.hideAddTracker !== undefined) {
+        db.prepare('UPDATE users SET hideAddTracker = ? WHERE id = ?').run(pending.hideAddTracker, req.userId);
+      }
+      if (pending.changesMaxHeight !== undefined) {
+        db.prepare('UPDATE users SET changesMaxHeight = ? WHERE id = ?').run(pending.changesMaxHeight, req.userId);
+      }
+      if (pending.disableAiSummary !== undefined) {
+        db.prepare('UPDATE users SET disableAiSummary = ? WHERE id = ?').run(pending.disableAiSummary, req.userId);
+      }
+      if (nextPasswordHash !== null) {
+        db.prepare('UPDATE users SET passwordHash = ? WHERE id = ?').run(nextPasswordHash, req.userId);
+      }
+    })();
+  } catch (err) {
+    if (/UNIQUE constraint failed: users\.email/i.test(err.message || '')) {
+      return res.status(409).json({ error: 'An account with that email already exists' });
+    }
+    if (/UNIQUE constraint failed: users\.username/i.test(err.message || '')) {
+      return res.status(409).json({ error: 'That username is already taken' });
+    }
+    log('✗', _c.red, `Profile update failed: ${err.message}`);
+    return res.status(500).json({ error: 'Failed to update profile' });
+  }
+
+  let verificationEmailSent = false;
+  if (emailChanged && _isSesConfigured()) {
+    const verifyUser = db.prepare('SELECT id, username, email FROM users WHERE id = ?').get(req.userId);
+    verificationEmailSent = await sendEmailVerificationEmail(verifyUser, req);
+  }
+
+  const updated = db.prepare('SELECT username, email, emailVerified FROM users WHERE id = ?').get(req.userId);
+  res.json({
+    success: true,
+    username: updated?.username || null,
+    email: updated?.email || null,
+    emailVerified: updated?.emailVerified === 1,
+    verificationEmailSent,
+    gravatarUrl: gravatarUrl(updated?.email, 96),
+  });
 });
 
 app.get('/api/auth/email-configured', authMiddleware, (req, res) => {
   res.json({ configured: _isSesConfigured() });
+});
+
+app.post('/api/auth/resend-verification', authMiddleware, async (req, res) => {
+  const user = db.prepare('SELECT id, username, email, emailVerified FROM users WHERE id = ?').get(req.userId);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  if (!user.email) return res.status(400).json({ error: 'No email address on your account.' });
+  if (user.emailVerified === 1) return res.json({ success: true, alreadyVerified: true });
+  if (!_isSesConfigured()) return res.status(503).json({ error: 'Email is not configured on this server.' });
+
+  const sent = await sendEmailVerificationEmail(user, req);
+  if (!sent) return res.status(500).json({ error: 'Failed to send verification email.' });
+  res.json({ success: true, sent: true });
 });
 
 app.post('/api/auth/test-email', authMiddleware, async (req, res) => {
@@ -1168,14 +1603,25 @@ app.get('/api/admin/settings', adminMiddleware, (req, res) => {
     maintenanceMode:      getSetting('maintenanceMode',      '0') === '1',
     defaultTrackerLimit:  parseInt(getSetting('defaultTrackerLimit',  '0')   || '0'),
     historyRetentionCap:  parseInt(getSetting('historyRetentionCap',  '500') || '500'),
+    userIntervalOptions:  getUserAllowedIntervals(),
   });
 });
 
 app.patch('/api/admin/settings', adminMiddleware, (req, res) => {
-  const allowed = ['allowRegistration', 'aiEnabled', 'maintenanceMode', 'defaultTrackerLimit', 'historyRetentionCap'];
+  const allowed = ['allowRegistration', 'aiEnabled', 'maintenanceMode', 'defaultTrackerLimit', 'historyRetentionCap', 'userIntervalOptions'];
+  const VALID_INTERVALS = new Set([60000, 300000, 900000, 1800000, 3600000, 14400000, 21600000, 43200000, 86400000, 259200000, 604800000]);
   for (const key of allowed) {
-    if (key in req.body) {
-      const val = req.body[key];
+    if (!(key in req.body)) continue;
+    const val = req.body[key];
+    if (key === 'userIntervalOptions') {
+      // Accept either a JSON string or a pre-parsed array from the client
+      let list;
+      try { list = typeof val === 'string' ? JSON.parse(val) : val; } catch { list = []; }
+      const clean = (Array.isArray(list) ? list : []).map(Number).filter(v => VALID_INTERVALS.has(v));
+      if (clean.length === 0)
+        return res.status(400).json({ error: 'At least one interval option must be enabled.' });
+      setSetting(key, JSON.stringify(clean));
+    } else {
       setSetting(key, typeof val === 'boolean' ? (val ? '1' : '0') : String(val));
     }
   }
@@ -1190,10 +1636,11 @@ app.post('/api/admin/users', adminMiddleware, async (req, res) => {
     return res.status(400).json({ error: 'Email address is required' });
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()))
     return res.status(400).json({ error: 'Please enter a valid email address' });
-  if (username.trim().length < 3)
-    return res.status(400).json({ error: 'Username must be at least 3 characters' });
-  if (password.length < 6)
-    return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  if (username.trim().length < 2)
+    return res.status(400).json({ error: 'Username must be at least 2 characters' });
+  const adminCreatePwError = passwordPolicyError(password, 'Password');
+  if (adminCreatePwError)
+    return res.status(400).json({ error: adminCreatePwError });
   const allowedRoles = ['user', 'admin'];
   const assignedRole = allowedRoles.includes(role) ? role : 'user';
 
@@ -1207,26 +1654,28 @@ app.post('/api/admin/users', adminMiddleware, async (req, res) => {
     const g = parseInt(getSetting('defaultTrackerLimit', '0') || '0');
     return g > 0 ? g : null;
   })();
-  const user = { id: uuidv4(), username: username.trim(), email: email.trim().toLowerCase(), passwordHash, role: assignedRole, createdAt: new Date().toISOString() };
-  db.prepare('INSERT INTO users (id, username, email, passwordHash, role, createdAt, trackerLimit) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run(user.id, user.username, user.email, user.passwordHash, user.role, user.createdAt, initLimit);
-  res.status(201).json({ id: user.id, username: user.username, role: user.role });
+  const user = { id: uuidv4(), username: username.trim(), email: email.trim().toLowerCase(), passwordHash, role: assignedRole, createdAt: new Date().toISOString(), emailVerified: 0 };
+  db.prepare('INSERT INTO users (id, username, email, passwordHash, role, createdAt, trackerLimit, emailVerified) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(user.id, user.username, user.email, user.passwordHash, user.role, user.createdAt, initLimit, user.emailVerified);
+  const verificationEmailSent = await sendEmailVerificationEmail(user, req);
+  res.status(201).json({ id: user.id, username: user.username, role: user.role, emailVerified: false, verificationEmailSent });
 });
 
 app.get('/api/admin/users', adminMiddleware, (req, res) => {
-  const users = db.prepare('SELECT id, username, email, role, createdAt, disabled, trackerLimit FROM users ORDER BY createdAt ASC').all();
+  const users = db.prepare('SELECT id, username, email, emailVerified, role, createdAt, disabled, trackerLimit FROM users ORDER BY createdAt ASC').all();
   const trackerCounts = {};
   trackers.forEach(t => { trackerCounts[t.userId] = (trackerCounts[t.userId] || 0) + 1; });
-  res.json(users.map(u => ({ ...u, disabled: u.disabled === 1, trackerCount: trackerCounts[u.id] || 0 })));
+  res.json(users.map(u => ({ ...u, emailVerified: u.emailVerified === 1, disabled: u.disabled === 1, trackerCount: trackerCounts[u.id] || 0, gravatarUrl: gravatarUrl(u.email, 40) })));
 });
 
-app.patch('/api/admin/users/:id', adminMiddleware, (req, res) => {
+app.patch('/api/admin/users/:id', adminMiddleware, async (req, res) => {
   const targetId = req.params.id;
   if (targetId === req.userId) return res.status(400).json({ error: 'Cannot modify your own account this way' });
   const user = db.prepare('SELECT id FROM users WHERE id = ?').get(targetId);
   if (!user) return res.status(404).json({ error: 'User not found' });
 
-  const { disabled, trackerLimit, email, role } = req.body;
+  const { disabled, trackerLimit, email, role, username, newPassword } = req.body;
+  let emailChanged = false;
 
   if (disabled !== undefined) {
     db.prepare('UPDATE users SET disabled = ? WHERE id = ?').run(disabled ? 1 : 0, targetId);
@@ -1249,15 +1698,32 @@ app.patch('/api/admin/users/:id', adminMiddleware, (req, res) => {
     db.prepare('UPDATE users SET trackerLimit = ? WHERE id = ?').run(limit, targetId);
   }
 
+  if (username !== undefined) {
+    const trimmed = String(username || '').trim();
+    if (trimmed.length < 2)
+      return res.status(400).json({ error: 'Username must be at least 2 characters' });
+    const conflict = db.prepare('SELECT id FROM users WHERE LOWER(username) = LOWER(?) AND id != ?').get(trimmed, targetId);
+    if (conflict) return res.status(409).json({ error: 'That username is already taken' });
+    db.prepare('UPDATE users SET username = ? WHERE id = ?').run(trimmed, targetId);
+  }
+
   if (email !== undefined) {
-    const trimmed = email?.trim() || null;
-    if (trimmed && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed))
+    const trimmed = (email || '').trim();
+    if (!trimmed)
+      return res.status(400).json({ error: 'Email address is required' });
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed))
       return res.status(400).json({ error: 'Please enter a valid email address' });
-    if (trimmed) {
-      const conflict = db.prepare('SELECT id FROM users WHERE LOWER(email) = LOWER(?) AND id != ?').get(trimmed, targetId);
-      if (conflict) return res.status(409).json({ error: 'An account with that email already exists' });
-    }
-    db.prepare('UPDATE users SET email = ? WHERE id = ?').run(trimmed ? trimmed.toLowerCase() : null, targetId);
+    const conflict = db.prepare('SELECT id FROM users WHERE LOWER(email) = LOWER(?) AND id != ?').get(trimmed, targetId);
+    if (conflict) return res.status(409).json({ error: 'An account with that email already exists' });
+    db.prepare('UPDATE users SET email = ?, emailVerified = 0 WHERE id = ?').run(trimmed.toLowerCase(), targetId);
+    emailChanged = true;
+  }
+
+  if (newPassword !== undefined && String(newPassword).trim() !== '') {
+    const pwError = passwordPolicyError(newPassword, 'New password');
+    if (pwError) return res.status(400).json({ error: pwError });
+    const hash = await bcrypt.hash(newPassword, 12);
+    db.prepare('UPDATE users SET passwordHash = ? WHERE id = ?').run(hash, targetId);
   }
 
   if (role !== undefined) {
@@ -1266,7 +1732,13 @@ app.patch('/api/admin/users/:id', adminMiddleware, (req, res) => {
     db.prepare('UPDATE users SET role = ? WHERE id = ?').run(role, targetId);
   }
 
-  res.json({ success: true });
+  let verificationEmailSent = false;
+  if (emailChanged && _isSesConfigured()) {
+    const verifyUser = db.prepare('SELECT id, username, email FROM users WHERE id = ?').get(targetId);
+    verificationEmailSent = await sendEmailVerificationEmail(verifyUser, req);
+  }
+
+  res.json({ success: true, verificationEmailSent });
 });
 
 app.delete('/api/admin/users/:id', adminMiddleware, (req, res) => {
@@ -1308,24 +1780,31 @@ app.patch('/api/admin/trackers/:id', adminMiddleware, (req, res) => {
     if (!tracker.active) stopTrackerTimer(tracker.id);
     else startTrackerTimer(tracker);
   }
-  saveTrackers(trackers);
+  _saveOneTracker(tracker);
   res.json({ success: true });
 });
 
 app.delete('/api/admin/trackers/:id', adminMiddleware, (req, res) => {
   const tracker = trackers.find(t => t.id === req.params.id);
   if (!tracker) return res.status(404).json({ error: 'Not found' });
+  const targetUserId = tracker.userId;
   stopTrackerTimer(tracker.id);
-  db.prepare('DELETE FROM changes WHERE trackerId = ?').run(tracker.id);
+  db.transaction(() => {
+    db.prepare('DELETE FROM changes WHERE trackerId = ?').run(tracker.id);
+    db.prepare('DELETE FROM trackers WHERE id = ?').run(tracker.id);
+  })();
   trackers = trackers.filter(t => t.id !== tracker.id);
-  saveTrackers(trackers);
+  const userTrackers = trackers
+    .filter(t => t.userId === targetUserId)
+    .map(({ lastBody, ...rest }) => rest);
+  broadcastToUser({ type: 'update', trackers: userTrackers }, targetUserId);
   res.json({ success: true });
 });
 
 app.post('/api/admin/impersonate/:id', adminMiddleware, (req, res) => {
   const targetId = req.params.id;
   if (targetId === req.userId) return res.status(400).json({ error: 'Cannot impersonate yourself' });
-  const target = db.prepare('SELECT id, username, role, notificationsEnabled FROM users WHERE id = ?').get(targetId);
+  const target = db.prepare('SELECT id, username, role, email, emailVerified, disabled, notificationsEnabled, hideAiFinder, hideAddTracker, changesMaxHeight, trackerLimit, disableAiSummary FROM users WHERE id = ?').get(targetId);
   if (!target) return res.status(404).json({ error: 'User not found' });
   if (target.disabled) return res.status(400).json({ error: 'Cannot impersonate a disabled account' });
 
@@ -1341,14 +1820,22 @@ app.post('/api/admin/impersonate/:id', adminMiddleware, (req, res) => {
   res.cookie('watchbot_auth', impersonateToken, { httpOnly: true, sameSite: 'lax', maxAge: COOKIE_MAX_AGE });
   res.json({ id: target.id, username: target.username, role: target.role || 'user',
     notificationsEnabled: target.notificationsEnabled !== 0,
+    hideAiFinder: target.hideAiFinder === 1,
+    hideAddTracker: target.hideAddTracker === 1,
+    changesMaxHeight: target.changesMaxHeight || 0,
+    trackerLimit: target.trackerLimit ?? null,
+    disableAiSummary: target.disableAiSummary === 1,
+    emailVerified: target.emailVerified === 1,
+    gravatarUrl: gravatarUrl(target.email, 64),
     impersonatedBy: { id: req.userId, username: req.username } });
 });
 
 app.post('/api/admin/stop-impersonate', (req, res) => {
   const restoreToken = req.cookies?.watchbot_restore;
   if (!restoreToken) return res.status(400).json({ error: 'No impersonation session to restore' });
+  let payload;
   try {
-    jwt.verify(restoreToken, JWT_SECRET);
+    payload = jwt.verify(restoreToken, JWT_SECRET);
   } catch {
     res.clearCookie('watchbot_restore');
     res.clearCookie('watchbot_auth');
@@ -1356,10 +1843,16 @@ app.post('/api/admin/stop-impersonate', (req, res) => {
   }
   res.cookie('watchbot_auth', restoreToken, { httpOnly: true, sameSite: 'lax', maxAge: COOKIE_MAX_AGE });
   res.clearCookie('watchbot_restore');
-  const payload = jwt.decode(restoreToken);
-  const user = db.prepare('SELECT role, notificationsEnabled FROM users WHERE id = ?').get(payload.userId);
-  res.json({ id: payload.userId, username: payload.username, role: user?.role || 'admin',
-    notificationsEnabled: user?.notificationsEnabled !== 0 });
+  const user = db.prepare('SELECT username, role, email, emailVerified, notificationsEnabled, hideAiFinder, hideAddTracker, changesMaxHeight, trackerLimit, disableAiSummary FROM users WHERE id = ?').get(payload.userId);
+  res.json({ id: payload.userId, username: user?.username || payload.username, role: user?.role || 'admin',
+    notificationsEnabled: user?.notificationsEnabled !== 0,
+    hideAiFinder: user?.hideAiFinder === 1,
+    hideAddTracker: user?.hideAddTracker === 1,
+    changesMaxHeight: user?.changesMaxHeight || 0,
+    trackerLimit: user?.trackerLimit ?? null,
+    disableAiSummary: user?.disableAiSummary === 1,
+    emailVerified: user?.emailVerified === 1,
+    gravatarUrl: gravatarUrl(user?.email, 64) });
 });
 
 // ─── FETCH PAGE TITLE ────────────────────────────────────────────────────────
@@ -1497,7 +1990,7 @@ Return exactly 30 results. Return only the JSON array, no other text.`
 });
 
 // ─── API ROUTES ───────────────────────────────────────────────────────────────
-app.post('/api/summarize', async (req, res) => {
+app.post('/api/summarize', authMiddleware, async (req, res) => {
   const { oldText, newText, url } = req.body;
   const summary = await getChangeSummary(oldText, newText, url);
   res.json({ summary });
@@ -1515,6 +2008,8 @@ app.post('/api/trackers', authMiddleware, async (req, res) => {
   const { url, label, interval, aiSummary, emailNotify } = req.body;
   if (!url) return res.status(400).json({ error: 'url is required' });
   try { new URL(url); } catch { return res.status(400).json({ error: 'Invalid URL' }); }
+  if (req.role !== 'admin' && interval && !getUserAllowedIntervals().includes(Number(interval)))
+    return res.status(400).json({ error: 'That check interval is not available. Please choose from the allowed options.' });
 
   const userRow = db.prepare('SELECT trackerLimit FROM users WHERE id = ?').get(req.userId);
   // null or 0 = unlimited; positive integer = hard cap. Global default is only applied at user creation.
@@ -1599,9 +2094,22 @@ app.delete('/api/trackers/:id', authMiddleware, (req, res) => {
 app.patch('/api/trackers/:id', authMiddleware, (req, res) => {
   const tracker = trackers.find(t => t.id === req.params.id && t.userId === req.userId);
   if (!tracker) return res.status(404).json({ error: 'Not found' });
-  ['active', 'label', 'interval', 'aiSummary', 'emailNotify'].forEach(k => {
-    if (req.body[k] !== undefined) tracker[k] = req.body[k];
-  });
+
+  if (req.body.interval !== undefined) {
+    const interval = Number(req.body.interval);
+    if (!Number.isFinite(interval) || interval <= 0)
+      return res.status(400).json({ error: 'Invalid interval' });
+    if (req.role !== 'admin' && !getUserAllowedIntervals().includes(interval)) {
+      return res.status(400).json({ error: 'That check interval is not available. Please choose from the allowed options.' });
+    }
+    tracker.interval = interval;
+  }
+
+  if (req.body.label !== undefined) tracker.label = String(req.body.label || '').trim();
+  if (req.body.active !== undefined) tracker.active = !!req.body.active;
+  if (req.body.aiSummary !== undefined) tracker.aiSummary = req.body.aiSummary !== false;
+  if (req.body.emailNotify !== undefined) tracker.emailNotify = !!req.body.emailNotify;
+
   if (req.body.active === false) stopTrackerTimer(tracker.id);
   else if (tracker.active) startTrackerTimer(tracker); // restart on any change (interval, active toggle)
   saveTrackers(trackers);
@@ -1682,7 +2190,7 @@ app.get('/api/trackers/:id/changes', authMiddleware, (req, res) => {
   const offset = Math.max(parseInt(req.query.offset) || 0, 0);
   const total  = db.prepare('SELECT COUNT(*) as c FROM changes WHERE trackerId = ?').get(req.params.id).c;
   const rows  = db.prepare(
-    'SELECT id, detectedAt, summary, dismissed, flagged, soft, snippet FROM changes WHERE trackerId = ? ORDER BY detectedAt DESC LIMIT ? OFFSET ?'
+    'SELECT id, detectedAt, summary, aiDisabledReason, dismissed, flagged, soft, snippet FROM changes WHERE trackerId = ? ORDER BY detectedAt DESC LIMIT ? OFFSET ?'
   ).all(req.params.id, limit, offset);
   const items = rows.map(r => ({ ...r, snippet: r.snippet ? JSON.parse(r.snippet) : null }));
   res.json({ items, total, offset, limit });
@@ -1708,10 +2216,43 @@ app.delete('/api/trackers/:id/changes', authMiddleware, (req, res) => {
 // ─── START ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   const userCount   = db.prepare('SELECT COUNT(*) as c FROM users').get().c;
+  const activeUsers = db.prepare('SELECT COUNT(*) as c FROM users WHERE disabled = 0').get().c;
   const activeCount = trackers.filter(t => t.active).length;
+  const changedCount = trackers.filter(t => t.status === 'changed').length;
+
+  const allowRegistration = getSetting('allowRegistration', '1') !== '0';
+  const maintenanceMode   = getSetting('maintenanceMode',   '0') === '1';
+  const aiEnabled         = getSetting('aiEnabled',         '1') !== '0';
+  const defaultLimit      = parseInt(getSetting('defaultTrackerLimit', '0') || '0');
+  const retentionCap      = Math.max(parseInt(getSetting('historyRetentionCap', '500') || '500'), 10);
+  const userIntervals     = getUserAllowedIntervals();
+
+  const aiApiConfigured = !!process.env.ANTHROPIC_API_KEY;
+  const sesConfigured   = _isSesConfigured();
+  const s3Configured    = !!(S3_MEDIA_BUCKET && CDN_BASE_URL);
+
+  const yn = (v, yes = 'enabled', no = 'disabled') => v ? `${_c.green}${yes}${_c.r}` : `${_c.red}${no}${_c.r}`;
+  const STARTUP_LABEL_WIDTH = 13; // keep colon alignment stable for Settings(raw)
+  const startupLine = (label, value) => {
+    console.log(`   ${_c.dim}${label.padEnd(STARTUP_LABEL_WIDTH)}:${_c.r} ${value}`);
+  };
+
   console.log(`\n${_c.bold}${_c.green}🤖 Watchbot${_c.r}  listening on ${_c.cyan}http://localhost:${PORT}${_c.r}`);
-  console.log(`   ${_c.dim}Database : ${DB_PATH}${_c.r}`);
-  console.log(`   ${_c.dim}Users    : ${userCount}  |  Trackers : ${trackers.length} total, ${activeCount} active${_c.r}`);
-  console.log(`   ${_c.dim}AI       : ${process.env.ANTHROPIC_API_KEY ? '✓ enabled' : '✗ set ANTHROPIC_API_KEY to enable'}${_c.r}\n`);
+  startupLine('Database', DB_PATH);
+  startupLine('Trackers', `${trackers.length} total, ${activeCount} active, ${changedCount} changed`);
+  startupLine('Users', `${userCount} total, ${activeUsers} active`);
+  startupLine('Settings', `registration ${yn(allowRegistration, 'open', 'closed')}, maintenance ${yn(maintenanceMode, 'on', 'off')}, AI summaries ${yn(aiEnabled, 'on', 'off')}`);
+  startupLine('Limits', `default tracker limit ${defaultLimit > 0 ? defaultLimit : 'none'}, history cap ${retentionCap}, user intervals ${userIntervals.length}`);
+  startupLine('CORS', CORS_ALLOWLIST.length > 0 ? CORS_ALLOWLIST.join(', ') : 'same-origin only');
+  startupLine('Integrations', `AI API ${yn(aiApiConfigured, 'configured', 'missing key')}, SES ${yn(sesConfigured, 'configured', 'not configured')}, S3 favicon cache ${yn(s3Configured, 'configured', 'not configured')}`);
+  startupLine('Runtime', `NODE_ENV ${process.env.NODE_ENV || 'development'}, CHECK_CONCURRENCY ${CHECK_CONCURRENCY}`);
+  if (aiEnabled && !aiApiConfigured) {
+    startupLine('Note', `${_c.yellow}AI summaries are enabled in settings, but ANTHROPIC_API_KEY is missing. Checks will log AI skipped/fallback summaries.${_c.r}`);
+  } else if (!aiEnabled && aiApiConfigured) {
+    startupLine('Note', `${_c.yellow}ANTHROPIC_API_KEY is configured, but AI summaries are disabled by Admin setting.${_c.r}`);
+  }
+  startupLine('Legend', `${_c.dim}↻ check start | ⚡ changed (includes AI used/skipped + reason) | · no changes found | ~ soft/no-significant change | ✓ baseline/success | ✗ error | ✉ email | ⇄ SSE | ⏱ scheduler${_c.r}`);
+  console.log('');
+
   trackers.forEach(t => { if (t.active) startTrackerTimer(t); });
 });

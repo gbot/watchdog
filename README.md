@@ -64,6 +64,7 @@ PORT=3000
 JWT_SECRET=your_long_random_secret_here
 ANTHROPIC_API_KEY=your_anthropic_api_key_here   # optional
 CHECK_CONCURRENCY=5                              # optional: max parallel checks (default 5)
+CORS_ALLOWED_ORIGINS=https://your-app.example.com # optional: comma-separated allowed origins for credentialed CORS
 ```
 
 > **`JWT_SECRET`** should be a long random string. Generate one with:
@@ -118,6 +119,7 @@ watchbot/
 | `JWT_SECRET` | **Yes** | Secret key for signing JWT tokens |
 | `ANTHROPIC_API_KEY` | No | Enables AI change summaries and resource finder |
 | `CHECK_CONCURRENCY` | No | Max parallel tracker checks (default: `5`) |
+| `CORS_ALLOWED_ORIGINS` | No | Comma-separated origin allowlist for credentialed CORS (e.g. `https://app.example.com,https://admin.example.com`). If unset, server allows only same-origin browser access; non-production also allows localhost on `PORT`. |
 
 ---
 

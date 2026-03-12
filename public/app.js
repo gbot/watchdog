@@ -5,6 +5,9 @@ let currentUser = null;
 let evtSource   = null;
 let confirmResolver   = null;
 let confirmKeyHandler = null;
+let _authResetToken   = '';
+let siteSettings      = { allowRegistration: true, maintenanceMode: false, userIntervalOptions: [] };
+let _sseProbePending  = false;
 
 // ─── TOOLTIP ENGINE ──────────────────────────────────────────────────────────
 // Single floating element driven by event delegation — works for all elements
@@ -79,6 +82,52 @@ let confirmKeyHandler = null;
   document.addEventListener('mousedown', hide);
 })();
 
+// ─── INTERVAL OPTIONS ───────────────────────────────────────────────────────
+// Two canonical sets — modify here to update all dropdowns at once.
+const INTERVAL_OPTIONS_ADMIN = [
+  { ms:      60000, label: '1 minute'  },
+  { ms:     300000, label: '5 minutes' },
+  { ms:     900000, label: '15 minutes'},
+  { ms:    1800000, label: '30 minutes'},
+  { ms:    3600000, label: '1 hour'    },
+  { ms:   14400000, label: '4 hours'   },
+  { ms:   21600000, label: '6 hours'   },
+  { ms:   43200000, label: '12 hours'  },
+  { ms:   86400000, label: '1 day'     },
+  { ms:  259200000, label: '3 days'    },
+  { ms:  604800000, label: '7 days'    },
+];
+// NOTE: user interval options are now dynamic, driven by the admin
+// "User interval options" site setting. Use _getIntervalOptions() everywhere.
+
+function _getIntervalOptions() {
+  if (currentUser?.role === 'admin') return INTERVAL_OPTIONS_ADMIN;
+  const allowed = siteSettings?.userIntervalOptions;
+  if (!allowed?.length) return INTERVAL_OPTIONS_ADMIN; // safe fallback
+  return INTERVAL_OPTIONS_ADMIN.filter(o => allowed.includes(o.ms));
+}
+
+function _refreshIntervalSelects() {
+  const opts  = _getIntervalOptions();
+  const iSel  = document.getElementById('intervalSelect');
+  if (iSel)   iSel.innerHTML  = _intervalOptionsHTML(opts, parseInt(iSel.value)  || null);
+  const toISel = document.getElementById('toIntervalSelect');
+  if (toISel) toISel.innerHTML = _intervalOptionsHTML(opts, parseInt(toISel.value) || null);
+}
+
+// Build <option> tags for an interval <select>.
+// If selectedMs is not in the list (e.g. a legacy sub-hour interval viewed by a user)
+// a synthetic "(current)" entry is prepended so the dropdown reflects reality.
+function _intervalOptionsHTML(options, selectedMs) {
+  let list = options;
+  if (selectedMs && !options.some(o => o.ms === selectedMs)) {
+    list = [{ ms: selectedMs, label: intervalText(selectedMs) + ' (current)' }, ...options];
+  }
+  return list.map(o =>
+    `<option value="${o.ms}"${o.ms === selectedMs ? ' selected' : ''}>${o.label}</option>`
+  ).join('');
+}
+
 // Tracker filter (client-side)
 let trackerFilter    = '';
 let showChangedOnly  = false;
@@ -86,6 +135,11 @@ let showActiveOnly   = false;
 let showAIOnly       = false;
 let showFlaggedOnly  = false;
 let _tcFlagFilter    = new Set();   // per-tracker "show flagged only" filter
+let _tcUnreadFilter  = new Set();   // per-tracker "show unread only" filter
+let _tcPendingHideAnim = new Set(); // trackers temporarily kept visible during filter-out animation
+let _tcPendingHideTimers = new Map();
+const _TC_FILTER_OUT_ANIM_MS = 320;
+const _TC_FILTER_OUT_TOAST_ENABLED = true; // Flip to false to disable this UX hint.
 
 // Admin panel — search & pagination state
 const ADMIN_PAGE_SIZE      = 25;
@@ -97,8 +151,89 @@ let adminTrackersSelected  = new Set();
 let adminUsersSelected     = new Set();
 let _adminCache            = { users: null, trackers: null, userMap: null };
 
+const PASSWORD_POLICY = Object.freeze({
+  minLength: 10,
+  requireUpper: /[A-Z]/,
+  requireLower: /[a-z]/,
+  requireNumber: /\d/,
+  requireSymbol: /[^A-Za-z0-9]/,
+});
+
+function _passwordPolicyError(prefix = 'Password') {
+  return `${prefix} must be at least ${PASSWORD_POLICY.minLength} characters and include uppercase, lowercase, a number, and a symbol.`;
+}
+
+function _evaluatePasswordStrength(password) {
+  const value = String(password || '');
+  const checks = {
+    length: value.length >= PASSWORD_POLICY.minLength,
+    upper: PASSWORD_POLICY.requireUpper.test(value),
+    lower: PASSWORD_POLICY.requireLower.test(value),
+    number: PASSWORD_POLICY.requireNumber.test(value),
+    symbol: PASSWORD_POLICY.requireSymbol.test(value),
+  };
+  const passed = Object.values(checks).filter(Boolean).length;
+  const valid = passed === 5;
+  const label = !value ? 'Weak' : valid ? (value.length >= 14 ? 'Strong' : 'Good') : (passed >= 4 ? 'Medium' : 'Weak');
+  return { checks, passed, total: 5, valid, label };
+}
+
+function _renderPasswordStrength(containerId, password) {
+  const root = document.getElementById(containerId);
+  const result = _evaluatePasswordStrength(password);
+  if (!root) return result;
+
+  root.classList.remove('is-weak', 'is-medium', 'is-good', 'is-strong');
+  const tierClass = !password
+    ? 'is-weak'
+    : result.valid
+      ? (password.length >= 14 ? 'is-strong' : 'is-good')
+      : (result.passed >= 4 ? 'is-medium' : 'is-weak');
+  root.classList.add(tierClass);
+
+  const label = root.querySelector('[data-role="label"]');
+  if (label) label.textContent = result.label;
+  const score = root.querySelector('[data-role="score"]');
+  if (score) score.textContent = `${result.passed}/${result.total}`;
+  const fill = root.querySelector('[data-role="fill"]');
+  if (fill) fill.style.width = `${password ? (result.passed / result.total) * 100 : 0}%`;
+
+  Object.entries(result.checks).forEach(([rule, ok]) => {
+    const el = root.querySelector(`[data-rule="${rule}"]`);
+    if (el) el.classList.toggle('ok', ok);
+  });
+  return result;
+}
+
+function _bindPasswordStrengthInput(inputId, containerId) {
+  const input = document.getElementById(inputId);
+  if (!input) return;
+  const refresh = () => _renderPasswordStrength(containerId, input.value);
+  input.addEventListener('input', refresh);
+  input.addEventListener('focus', refresh);
+  setTimeout(refresh, 0);
+}
+
+function _togglePwVisibility(inputId, btn) {
+  const input = document.getElementById(inputId);
+  if (!input) return;
+  const willShow = input.type === 'password';
+  input.type = willShow ? 'text' : 'password';
+  const icon = btn.querySelector('.material-icons');
+  if (icon) icon.textContent = willShow ? 'visibility_off' : 'visibility';
+}
+
+function initPasswordStrengthCheckers() {
+  _bindPasswordStrengthInput('registerPassword', 'registerPasswordStrength');
+  _bindPasswordStrengthInput('adminNewPassword', 'adminNewPasswordStrength');
+  _bindPasswordStrengthInput('profileNewPw', 'profileNewPasswordStrength');
+  _bindPasswordStrengthInput('editUserNewPassword', 'editUserPasswordStrength');
+  _bindPasswordStrengthInput('resetNewPassword', 'resetPasswordStrength');
+}
+
 // ─── INIT ─────────────────────────────────────────────────────────────────────
 async function init() {
+  initPasswordStrengthCheckers();
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/sw.js').catch(() => {});
   }
@@ -107,6 +242,8 @@ async function init() {
     const sr = await fetch('/api/settings');
     if (sr.ok) siteSettings = await sr.json();
   } catch {}
+
+  const authAction = _extractAuthActionFromUrl();
 
   // Check session
   let meRes;
@@ -133,6 +270,8 @@ async function init() {
       showAuthOverlay('login');
     }
   }
+
+  await _processAuthActionFromUrl(authAction);
 }
 
 let _maintPollTimer = null;
@@ -209,12 +348,222 @@ function switchAuthTab(tab) {
   );
   document.getElementById('loginForm').style.display    = tab === 'login'    ? '' : 'none';
   document.getElementById('registerForm').style.display = tab === 'register' ? '' : 'none';
+  const forgotForm = document.getElementById('forgotForm');
+  if (forgotForm) forgotForm.style.display = 'none';
+  const resetForm = document.getElementById('resetForm');
+  if (resetForm) resetForm.style.display = 'none';
   document.getElementById('authError').textContent = '';
+  _setAuthInfo('');
+  _authResetToken = '';
+  if (tab === 'register') {
+    _renderPasswordStrength('registerPasswordStrength', document.getElementById('registerPassword')?.value || '');
+  }
+}
+
+function _setAuthInfo(text, type = '') {
+  const el = document.getElementById('authInfo');
+  if (!el) return;
+  el.textContent = text || '';
+  el.className = `auth-info${type ? ` ${type}` : ''}`;
+}
+
+function _setAuthFormMsg(id, text, type = '') {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = text || '';
+  el.className = `auth-form-msg${type ? ` ${type}` : ''}`;
+}
+
+function openForgotPassword() {
+  switchAuthTab('login');
+  const loginForm = document.getElementById('loginForm');
+  const registerForm = document.getElementById('registerForm');
+  const forgotForm = document.getElementById('forgotForm');
+  if (loginForm) loginForm.style.display = 'none';
+  if (registerForm) registerForm.style.display = 'none';
+  if (forgotForm) forgotForm.style.display = '';
+  _setAuthFormMsg('forgotMsg', '');
+  setTimeout(() => document.getElementById('forgotEmail')?.focus(), 80);
+}
+
+function openResetPasswordFromToken(token) {
+  switchAuthTab('login');
+  const loginForm = document.getElementById('loginForm');
+  const registerForm = document.getElementById('registerForm');
+  const resetForm = document.getElementById('resetForm');
+  if (loginForm) loginForm.style.display = 'none';
+  if (registerForm) registerForm.style.display = 'none';
+  if (resetForm) resetForm.style.display = '';
+  _authResetToken = token || '';
+  document.getElementById('resetNewPassword').value = '';
+  document.getElementById('resetConfirmPassword').value = '';
+  _renderPasswordStrength('resetPasswordStrength', '');
+  _setAuthFormMsg('resetMsg', '');
+  _setAuthInfo('Use a strong new password to complete reset.', '');
+  setTimeout(() => document.getElementById('resetNewPassword')?.focus(), 80);
+}
+
+function backToLoginFromAuthFlow() {
+  switchAuthTab('login');
+  _setAuthInfo('');
+  _setAuthFormMsg('forgotMsg', '');
+  _setAuthFormMsg('resetMsg', '');
+}
+
+async function handleForgotPassword(e) {
+  e.preventDefault();
+  const email = document.getElementById('forgotEmail').value.trim();
+  _setAuthFormMsg('forgotMsg', '');
+  if (!email) {
+    _setAuthFormMsg('forgotMsg', 'Email is required.', 'error');
+    return;
+  }
+  try {
+    const res = await fetch('/api/auth/forgot-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      _setAuthFormMsg('forgotMsg', data.error || 'Failed to request reset link.', 'error');
+      return;
+    }
+    _setAuthFormMsg('forgotMsg', data.message || 'If an account exists for that email, a reset link has been sent.', 'success');
+  } catch {
+    _setAuthFormMsg('forgotMsg', 'Connection error. Please try again.', 'error');
+  }
+}
+
+async function handleResetPassword(e) {
+  e.preventDefault();
+  const newPassword = document.getElementById('resetNewPassword').value;
+  const confirmPassword = document.getElementById('resetConfirmPassword').value;
+  _setAuthFormMsg('resetMsg', '');
+  if (!_authResetToken) {
+    _setAuthFormMsg('resetMsg', 'Reset token is missing. Request a new password reset email.', 'error');
+    return;
+  }
+  if (!newPassword || !confirmPassword) {
+    _setAuthFormMsg('resetMsg', 'Both password fields are required.', 'error');
+    return;
+  }
+  if (newPassword !== confirmPassword) {
+    _setAuthFormMsg('resetMsg', 'Passwords do not match.', 'error');
+    return;
+  }
+  const strength = _evaluatePasswordStrength(newPassword);
+  if (!strength.valid) {
+    _setAuthFormMsg('resetMsg', _passwordPolicyError('New password'), 'error');
+    return;
+  }
+
+  try {
+    const res = await fetch('/api/auth/reset-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: _authResetToken, newPassword }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      _setAuthFormMsg('resetMsg', data.error || 'Failed to reset password.', 'error');
+      return;
+    }
+    _authResetToken = '';
+    backToLoginFromAuthFlow();
+    _setAuthInfo('Password reset successful. You can now sign in.', 'success');
+  } catch {
+    _setAuthFormMsg('resetMsg', 'Connection error. Please try again.', 'error');
+  }
+}
+
+function _extractAuthActionFromUrl() {
+  try {
+    const params = new URLSearchParams(window.location.search || '');
+    const action = params.get('action');
+    const token = params.get('token');
+    if (!action || !token) return null;
+    params.delete('action');
+    params.delete('token');
+    const q = params.toString();
+    const nextUrl = `${window.location.pathname}${q ? `?${q}` : ''}${window.location.hash || ''}`;
+    window.history.replaceState({}, '', nextUrl);
+    return { action, token };
+  } catch {
+    return null;
+  }
+}
+
+async function _processAuthActionFromUrl(action) {
+  if (!action?.action || !action?.token) return;
+  if (document.body.classList.contains('maintenance-active')) return;
+
+  if (action.action === 'verify-email') {
+    try {
+      const res = await fetch('/api/auth/verify-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: action.token }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        if (currentUser) {
+          showSnackbar(data.error || 'Email verification failed.', 'error');
+        } else {
+          if (!document.getElementById('authOverlay')?.classList.contains('show')) showAuthOverlay('login');
+          _setAuthInfo(data.error || 'Email verification failed.', 'error');
+        }
+        return;
+      }
+      if (currentUser) {
+        currentUser.emailVerified = true;
+        showSnackbar('Email verified successfully.');
+      } else {
+        if (!document.getElementById('authOverlay')?.classList.contains('show')) showAuthOverlay('login');
+        _setAuthInfo('Email verified successfully. You can now sign in.', 'success');
+      }
+    } catch {
+      if (currentUser) {
+        showSnackbar('Unable to verify email right now. Please try again later.', 'error');
+      } else {
+        if (!document.getElementById('authOverlay')?.classList.contains('show')) showAuthOverlay('login');
+        _setAuthInfo('Unable to verify email right now. Please try again later.', 'error');
+      }
+    }
+    return;
+  }
+
+  if (action.action === 'reset-password') {
+    if (!document.getElementById('authOverlay')?.classList.contains('show')) showAuthOverlay('login');
+    openResetPasswordFromToken(action.token);
+  }
+}
+
+function _setAvatarImage(imgId, fallbackId, url) {
+  const img = document.getElementById(imgId);
+  const fallback = document.getElementById(fallbackId);
+  if (!img || !fallback) return;
+  if (url) {
+    img.src = url;
+    img.style.display = 'block';
+    fallback.style.display = 'none';
+  } else {
+    img.removeAttribute('src');
+    img.style.display = 'none';
+    fallback.style.display = '';
+  }
+}
+
+function _refreshCurrentUserAvatars(source = currentUser) {
+  const url = source?.gravatarUrl || null;
+  _setAvatarImage('topbarAvatarImg', 'topbarAvatarFallback', url);
+  _setAvatarImage('profileAvatarImg', 'profileAvatarFallback', url);
 }
 
 function showApp() {
   hideAuthOverlay();
   document.getElementById('userDisplay').textContent = currentUser.username;
+  _refreshCurrentUserAvatars(currentUser);
   document.getElementById('userArea').style.display  = 'flex';
   const adminBtn = document.getElementById('adminPanelBtn');
   const banner   = document.getElementById('impersonationBanner');
@@ -233,6 +582,12 @@ function showApp() {
   applyPanelPrefs(currentUser);
   // Restore cached AI finder results if any
   _aiCacheRestore();
+  // Populate interval selects based on current user's role + admin-configured user options
+  const _iSel = document.getElementById('intervalSelect');
+  if (_iSel) _iSel.innerHTML = _intervalOptionsHTML(_getIntervalOptions(), null);
+  const _toISel = document.getElementById('toIntervalSelect');
+  if (_toISel) _toISel.innerHTML = _intervalOptionsHTML(_getIntervalOptions(), null);
+
   // Sync filter state with whatever the browser restored on reload
   showChangedOnly = document.getElementById('showChangedOnlyChk')?.checked ?? false;
   showActiveOnly  = document.getElementById('showActiveOnlyChk')?.checked  ?? false;
@@ -279,20 +634,24 @@ function toggleCardCollapse(cardId) {
 
 async function handleLogin(e) {
   e.preventDefault();
-  const username = document.getElementById('loginUsername').value.trim();
+  const identifier = document.getElementById('loginUsername').value.trim();
   const password = document.getElementById('loginPassword').value;
   const errorEl  = document.getElementById('authError');
   errorEl.textContent = '';
+  _setAuthInfo('');
   try {
     const res  = await fetch('/api/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password })
+      body: JSON.stringify({ identifier, password })
     });
     const data = await res.json();
     if (!res.ok) { errorEl.textContent = data.error || 'Login failed'; return; }
     currentUser = data;
     showApp();
+    if (currentUser.emailVerified === false) {
+      showSnackbar('Your email is not verified yet. Use Account settings to send a verification email.');
+    }
   } catch {
     errorEl.textContent = 'Connection error. Is the server running?';
   }
@@ -306,6 +665,9 @@ async function handleRegister(e) {
   const confirm  = document.getElementById('registerConfirm').value;
   const errorEl  = document.getElementById('authError');
   errorEl.textContent = '';
+  _setAuthInfo('');
+  const strength = _evaluatePasswordStrength(password);
+  if (!strength.valid) { errorEl.textContent = _passwordPolicyError('Password'); return; }
   if (password !== confirm) { errorEl.textContent = 'Passwords do not match'; return; }
   try {
     const res  = await fetch('/api/auth/register', {
@@ -318,6 +680,13 @@ async function handleRegister(e) {
     currentUser = data;
     showApp();
     showSnackbar(`Welcome to Watchbot, ${currentUser.username}!`);
+    if (currentUser.emailVerified === false) {
+      showSnackbar(
+        currentUser.verificationEmailSent
+          ? 'Verification email sent. Please confirm your email address.'
+          : 'Account created. Email verification is pending (email service may be unavailable).'
+      );
+    }
   } catch {
     errorEl.textContent = 'Connection error. Is the server running?';
   }
@@ -351,6 +720,9 @@ async function openAdminPanel() {
   if (usEl) usEl.value = '';
   const trEl = document.getElementById('adminTrackersSearchInput');
   if (trEl) trEl.value = '';
+  const adminPwEl = document.getElementById('adminNewPassword');
+  if (adminPwEl) adminPwEl.value = '';
+  _renderPasswordStrength('adminNewPasswordStrength', document.getElementById('adminNewPassword')?.value || '');
   const overlay = document.getElementById('adminOverlay');
   overlay.classList.add('show');
   overlay.setAttribute('aria-hidden', 'false');
@@ -434,7 +806,7 @@ function renderAdminSettingsTab(s) {
         <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding-bottom:16px;border-bottom:1px solid var(--divider)">
           <div>
             <div style="font-size:14px;font-weight:600">AI summaries</div>
-            <div style="font-size:12px;color:var(--on-surface-medium);margin-top:3px">Master switch for all Anthropic AI API calls. Disabling saves API costs site-wide.</div>
+            <div style="font-size:12px;color:var(--on-surface-medium);margin-top:3px">Master switch for all AI-generated change summaries. Does not affect the AI Resource Finder. Disabling saves API costs site-wide.</div>
           </div>
           <label class="toggle" style="flex-shrink:0;margin-top:2px" data-tip="${s.aiEnabled ? 'Disable AI' : 'Enable AI'}">
             <input type="checkbox" ${s.aiEnabled ? 'checked' : ''} onchange="saveAdminSetting('aiEnabled', this.checked)">
@@ -445,7 +817,7 @@ function renderAdminSettingsTab(s) {
         <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding-bottom:16px;border-bottom:1px solid var(--divider)">
           <div>
             <div style="font-size:14px;font-weight:600">Maintenance mode</div>
-            <div style="font-size:12px;color:var(--on-surface-medium);margin-top:3px">Blocks all non-admin users from the app. Admins are unaffected.</div>
+            <div style="font-size:12px;color:var(--on-surface-medium);margin-top:3px">Logs out all non-admin users and displays "Maintenance in progress" message. Non-admin users can not login during maintenance. Admins are unaffected.</div>
           </div>
           <label class="toggle" style="flex-shrink:0;margin-top:2px" data-tip="${s.maintenanceMode ? 'Disable maintenance mode' : 'Enable maintenance mode'}">
             <input type="checkbox" ${s.maintenanceMode ? 'checked' : ''} onchange="saveAdminSetting('maintenanceMode', this.checked)">
@@ -465,7 +837,7 @@ function renderAdminSettingsTab(s) {
           </div>
         </div>
 
-        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding-bottom:16px;border-bottom:1px solid var(--divider)">
           <div style="flex:1">
             <div style="font-size:14px;font-weight:600">Change history retention cap</div>
             <div style="font-size:12px;color:var(--on-surface-medium);margin-top:3px">Max unflagged change entries kept across all trackers. Oldest entries are pruned automatically. Flagged changes are never pruned. Minimum <strong>10</strong>.</div>
@@ -474,6 +846,29 @@ function renderAdminSettingsTab(s) {
             <input type="number" id="adminHistoryRetentionCap" min="10" step="10" value="${s.historyRetentionCap}"
               style="width:70px;padding:6px 8px;border:1px solid var(--divider);border-radius:8px;font-size:13px;background:var(--surface);color:var(--on-surface);text-align:right"
               onchange="saveAdminSetting('historyRetentionCap', Math.max(10, parseInt(this.value) || 500))" />
+          </div>
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:12px">
+          <div>
+            <div style="font-size:14px;font-weight:600">User interval options</div>
+            <div style="font-size:12px;color:var(--on-surface-medium);margin-top:3px">Select which check intervals are available to non-admin users when <strong>creating</strong> new WatchBots. Admins always have access to all intervals. Existing trackers are unaffected.</div>
+          </div>
+          <div style="display:flex;flex-wrap:wrap;gap:8px">
+            ${(() => {
+              const on = new Set(s.userIntervalOptions || []);
+              return INTERVAL_OPTIONS_ADMIN.map(o => {
+                const active  = on.has(o.ms);
+                const border  = active ? 'var(--primary)' : 'var(--divider)';
+                const bg      = active ? 'var(--primary)' : 'var(--surface)';
+                const color   = active ? '#fff'           : 'var(--on-surface-medium)';
+                const weight  = active ? '600'            : '400';
+                return '<button type="button"'
+                  + ' onclick="_setUserIntervalOptions(' + o.ms + ', ' + !active + ')"'
+                  + ' style="padding:5px 14px;border-radius:20px;font-family:inherit;cursor:pointer;transition:all 0.15s;line-height:1.4;font-size:13px;font-weight:' + weight + ';border:1.5px solid ' + border + ';background:' + bg + ';color:' + color + '">'
+                  + o.label + '</button>';
+              }).join('');
+            })()}
           </div>
         </div>
 
@@ -491,13 +886,46 @@ async function saveAdminSetting(key, value) {
     });
     if (!res.ok) throw new Error();
     if (_adminCache.settings) _adminCache.settings[key] = value;
-    // Keep public siteSettings in sync for registration/maintenance
+    // Keep public siteSettings in sync
     if (key === 'allowRegistration') siteSettings.allowRegistration = value;
     if (key === 'maintenanceMode')   siteSettings.maintenanceMode   = value;
+    if (key === 'userIntervalOptions') {
+      const parsed = Array.isArray(value) ? value : JSON.parse(value);
+      if (_adminCache.settings) _adminCache.settings.userIntervalOptions = parsed;
+      siteSettings.userIntervalOptions = parsed;
+      _refreshIntervalSelects();
+      if (_adminCache.settings) renderAdminSettingsTab(_adminCache.settings);
+    }
     showSnackbar('Setting saved');
   } catch {
     showSnackbar('Failed to save setting', 'error');
   }
+}
+
+// Toggle a single interval on/off in the user interval options setting.
+function _setUserIntervalOptions(ms, enabled) {
+  const current = Array.isArray(siteSettings?.userIntervalOptions)
+    ? siteSettings.userIntervalOptions.slice()
+    : INTERVAL_OPTIONS_ADMIN.map(o => o.ms);
+  let updated;
+  if (enabled) {
+    updated = [...new Set([...current, ms])].sort((a, b) => a - b);
+  } else {
+    if (current.length <= 1) { showSnackbar('At least one interval must remain enabled', 'error'); return; }
+    updated = current.filter(v => v !== ms);
+  }
+  saveAdminSetting('userIntervalOptions', JSON.stringify(updated));
+}
+
+function _adminUserById(id) {
+  return _adminCache.users?.find(u => u.id === id) || null;
+}
+
+function _adminAvatarFallback(img) {
+  if (!img) return;
+  img.style.display = 'none';
+  const fallback = img.nextElementSibling;
+  if (fallback) fallback.style.display = 'flex';
 }
 
 function renderAdminUsersTable(users) {
@@ -519,8 +947,10 @@ function renderAdminUsersTable(users) {
     tbody.innerHTML = page.map(u => `
       <tr>
         <td>${u.id === currentUser.id ? '' : `<input type="checkbox" data-usel="${u.id}" ${adminUsersSelected.has(u.id) ? 'checked' : ''} onchange="adminUserSelectToggle('${u.id}', this.checked)" style="cursor:pointer;accent-color:var(--primary)">`}</td>
-        <td><strong>${escHtml(u.username)}</strong></td>
-        <td>${u.email ? escHtml(u.email) : '<span style="color:var(--on-surface-light)">—</span>'}</td>
+        <td><div class="admin-user-cell"><span class="admin-user-avatar">${u.gravatarUrl ? `<img src="${escHtml(u.gravatarUrl)}" alt="${escHtml(u.username)} avatar" loading="lazy" referrerpolicy="no-referrer" onerror="_adminAvatarFallback(this)"><span class="material-icons" style="display:none">person</span>` : '<span class="material-icons">person</span>'}</span><strong>${escHtml(u.username)}</strong></div></td>
+        <td>${u.email
+          ? `${escHtml(u.email)} <span class="profile-email-verify-status ${u.emailVerified ? 'verified' : 'unverified'}" style="margin-left:6px;font-size:10px;padding:2px 8px">${u.emailVerified ? 'Verified' : 'Unverified'}</span>`
+          : '<span style="color:var(--on-surface-light)">—</span>'}</td>
         <td><span class="admin-role-badge admin-role-${u.role === 'admin' ? 'admin' : 'user'}">${u.role === 'admin' ? 'Admin' : 'User'}</span></td>
         <td>${u.trackerCount}</td>
         <td>${u.id === currentUser.id ? '—' : `<input type="number" min="0" value="${u.trackerLimit ?? ''}" placeholder="∞"
@@ -533,13 +963,13 @@ function renderAdminUsersTable(users) {
         <td style="color:var(--on-surface-medium);font-size:12px">${new Date(u.createdAt).toLocaleDateString()}</td>
         <td>${u.id === currentUser.id ? '' : `
           <div class="btn-group">
-            <button class="btn-icon" style="color:var(--on-surface-medium)" data-tip="Edit user" onclick="openEditUser('${u.id}','${escHtml(u.username)}','${escHtml(u.email||'')}','${u.role}')">
+            <button class="btn-icon" style="color:var(--on-surface-medium)" data-tip="Edit user" onclick="openEditUserById('${u.id}')">
               <span class="material-icons" style="font-size:18px">edit</span>
             </button>
-            <button class="btn-icon" style="color:var(--primary)" data-tip="Impersonate user" onclick="adminImpersonate('${u.id}','${escHtml(u.username)}')">
+            <button class="btn-icon" style="color:var(--primary)" data-tip="Impersonate user" onclick="adminImpersonate('${u.id}')">
               <span class="material-icons" style="font-size:18px">theater_comedy</span>
             </button>
-            <button class="btn-icon" style="color:var(--error)" data-tip="Delete user" onclick="adminDeleteUser('${u.id}','${escHtml(u.username)}')">
+            <button class="btn-icon" style="color:var(--error)" data-tip="Delete user" onclick="adminDeleteUser('${u.id}')">
               <span class="material-icons" style="font-size:18px">person_remove</span>
             </button>
           </div>`}</td>
@@ -843,6 +1273,13 @@ async function adminAddUser() {
     return;
   }
 
+  const strength = _evaluatePasswordStrength(password);
+  if (!strength.valid) {
+    msgEl.textContent = _passwordPolicyError('Password');
+    msgEl.classList.add('error');
+    return;
+  }
+
   const res  = await fetch('/api/admin/users', {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -853,29 +1290,33 @@ async function adminAddUser() {
     msgEl.textContent = data.error || 'Failed to create user.';
     msgEl.classList.add('error');
   } else {
-    msgEl.textContent = `User "${data.username}" created.`;
+    msgEl.textContent = data.verificationEmailSent
+      ? `User "${data.username}" created. Verification email sent.`
+      : `User "${data.username}" created.`;
     msgEl.classList.add('success');
     document.getElementById('adminNewUsername').value = '';
     document.getElementById('adminNewEmail').value = '';
     document.getElementById('adminNewPassword').value = '';
     document.getElementById('adminNewRole').value = 'user';
+    _renderPasswordStrength('adminNewPasswordStrength', '');
     loadAdminTab('users');
   }
 }
 
-async function adminDeleteUser(id, username) {
-  const ok = await openDeleteConfirmDialog(`user "${username}" and all their trackers`, 'Delete user?');
+async function adminDeleteUser(id, username = null) {
+  const resolvedName = username || _adminUserById(id)?.username || 'this user';
+  const ok = await openDeleteConfirmDialog(`user "${resolvedName}" and all their trackers`, 'Delete user?');
   if (!ok) return;
   const res = await fetch(`/api/admin/users/${id}`, { method: 'DELETE' });
   if (res.ok) {
     adminUsersSelected.delete(id);
     _adminCache.users = null;
-    showSnackbar(`User ${username} deleted.`);
+    showSnackbar(`User ${resolvedName} deleted.`);
     loadAdminTab('users');
   } else { const d = await res.json(); showSnackbar(d.error || 'Delete failed', 'error'); }
 }
 
-async function adminImpersonate(id, username) {
+async function adminImpersonate(id) {
   const res = await fetch(`/api/admin/impersonate/${id}`, { method: 'POST' });
   const data = await res.json();
   if (!res.ok) { showSnackbar(data.error || 'Failed to impersonate', 'error'); return; }
@@ -901,20 +1342,32 @@ async function stopImpersonating() {
 // ─── EDIT USER ───────────────────────────────────────────────────────────────
 let editUserId = null;
 
-function openEditUser(id, username, email, role) {
-  editUserId = id;
-  const cached = _adminCache.users?.find(u => u.id === id);
-  document.getElementById('editUserSubtitle').textContent = username;
-  document.getElementById('editUserEmail').value = email;
-  document.getElementById('editUserRole').value = role;
-  document.getElementById('editUserLimit').value = cached?.trackerLimit ?? '';
+function openEditUserById(id) {
+  const user = _adminUserById(id);
+  if (!user) {
+    showSnackbar('Unable to load user details. Please refresh and try again.', 'error');
+    return;
+  }
+  openEditUser(user);
+}
+
+function openEditUser(user) {
+  editUserId = user.id;
+  document.getElementById('editUserSubtitle').textContent = user.username;
+  _setAvatarImage('editUserAvatarImg', 'editUserAvatarFallback', user.gravatarUrl || null);
+  document.getElementById('editUserUsername').value = user.username;
+  document.getElementById('editUserEmail').value = user.email || '';
+  document.getElementById('editUserNewPassword').value = '';
+  _renderPasswordStrength('editUserPasswordStrength', '');
+  document.getElementById('editUserRole').value = user.role;
+  document.getElementById('editUserLimit').value = user.trackerLimit ?? '';
   document.getElementById('editUserMsg').textContent = '';
   document.getElementById('editUserMsg').className = 'profile-msg';
   const overlay = document.getElementById('editUserOverlay');
   overlay.classList.add('show');
   overlay.setAttribute('aria-hidden', 'false');
   document.body.classList.add('modal-open');
-  document.getElementById('editUserEmail').focus();
+  document.getElementById('editUserUsername').focus();
 }
 
 function closeEditUser() {
@@ -927,7 +1380,9 @@ function closeEditUser() {
 
 async function saveEditUser() {
   if (!editUserId) return;
+  const username = document.getElementById('editUserUsername').value.trim();
   const email = document.getElementById('editUserEmail').value.trim();
+  const newPassword = document.getElementById('editUserNewPassword').value;
   const role  = document.getElementById('editUserRole').value;
   const limitRaw = document.getElementById('editUserLimit').value;
   const trackerLimit = limitRaw === '' ? null : parseInt(limitRaw);
@@ -935,8 +1390,32 @@ async function saveEditUser() {
   msgEl.textContent = '';
   msgEl.className = 'profile-msg';
 
-  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+  if (!username) {
+    msgEl.textContent = 'Username is required.';
+    msgEl.classList.add('error');
+    return;
+  }
+
+  if (username.length < 2) {
+    msgEl.textContent = 'Username must be at least 2 characters.';
+    msgEl.classList.add('error');
+    return;
+  }
+
+  if (!email) {
+    msgEl.textContent = 'Email address is required.';
+    msgEl.classList.add('error');
+    return;
+  }
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     msgEl.textContent = 'Please enter a valid email address.';
+    msgEl.classList.add('error');
+    return;
+  }
+
+  if (newPassword && !_evaluatePasswordStrength(newPassword).valid) {
+    msgEl.textContent = _passwordPolicyError('New password');
     msgEl.classList.add('error');
     return;
   }
@@ -944,14 +1423,14 @@ async function saveEditUser() {
   const res = await fetch(`/api/admin/users/${editUserId}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email: email || null, role, trackerLimit }),
+    body: JSON.stringify({ username, email, role, trackerLimit, ...(newPassword ? { newPassword } : {}) }),
   });
   const data = await res.json();
   if (!res.ok) {
     msgEl.textContent = data.error || 'Failed to save changes.';
     msgEl.classList.add('error');
   } else {
-    showSnackbar('User updated.');
+    showSnackbar(data.verificationEmailSent ? 'User updated. Verification email sent.' : 'User updated.');
     closeEditUser();
     loadAdminTab('users');
   }
@@ -1019,31 +1498,64 @@ async function adminDeleteTracker(id, label) {
 }
 
 // ─── PROFILE ──────────────────────────────────────────────────────────────────
+function _renderProfileEmailVerification(source = currentUser) {
+  const statusEl = document.getElementById('profileEmailVerifyStatus');
+  const resendBtn = document.getElementById('profileResendVerificationBtn');
+  if (!statusEl || !resendBtn) return;
+  const hasEmail = !!(source?.email || document.getElementById('profileEmail')?.value?.trim());
+  const verified = source?.emailVerified === true;
+
+  if (!hasEmail) {
+    statusEl.textContent = 'No email on account';
+    statusEl.className = 'profile-email-verify-status';
+    resendBtn.style.display = 'none';
+    return;
+  }
+
+  statusEl.textContent = verified ? 'Email verified' : 'Email not verified';
+  statusEl.className = `profile-email-verify-status ${verified ? 'verified' : 'unverified'}`;
+  resendBtn.style.display = verified ? 'none' : 'inline-flex';
+}
+
 async function openProfile() {
   document.getElementById('profileEmailMsg').textContent = '';
   document.getElementById('profilePwMsg').textContent    = '';
   document.getElementById('profileEmailMsg').className   = 'profile-msg';
   document.getElementById('profilePwMsg').className      = 'profile-msg';
-  document.getElementById('profileCurrentPw').value = '';
   document.getElementById('profileNewPw').value      = '';
   document.getElementById('profileConfirmPw').value  = '';
+  _renderPasswordStrength('profileNewPasswordStrength', '');
   document.getElementById('profileDeletePw').value   = '';
   if (document.getElementById('profileDeleteMsg')) {
     document.getElementById('profileDeleteMsg').textContent = '';
     document.getElementById('profileDeleteMsg').className   = 'profile-msg';
   }
   document.getElementById('profileUsernameDisplay').textContent = currentUser?.username || '';
+  document.getElementById('profileUsername').value = currentUser?.username || '';
+  const _unMsg = document.getElementById('profileUsernameMsg');
+  if (_unMsg) { _unMsg.textContent = ''; _unMsg.className = 'profile-msg'; }
+  _refreshCurrentUserAvatars(currentUser);
+  _renderProfileEmailVerification(currentUser);
 
   try {
     const res = await fetch('/api/auth/profile');
     if (res.ok) {
       const profile = await res.json();
       document.getElementById('profileEmail').value = profile.email || '';
+      document.getElementById('profileUsername').value = profile.username || '';
       document.getElementById('profileNotifications').checked = profile.notificationsEnabled !== false;
       document.getElementById('profileGlobalEmail').checked   = profile.globalEmailNotify  !== false;
       document.getElementById('profileHideAiFinder').checked   = profile.hideAiFinder   === true;
       document.getElementById('profileHideAddTracker').checked = profile.hideAddTracker  === true;
       document.getElementById('profileChangesMaxHeight').value  = profile.changesMaxHeight || 0;
+      document.getElementById('profileDisableAiSummary').checked = profile.disableAiSummary === true;
+      if (currentUser) {
+        currentUser.email = profile.email || null;
+        currentUser.emailVerified = profile.emailVerified === true;
+        currentUser.gravatarUrl = profile.gravatarUrl || null;
+      }
+      _renderProfileEmailVerification(profile);
+      _refreshCurrentUserAvatars(profile);
       applyPanelPrefs(profile);
     }
   } catch {}
@@ -1071,11 +1583,54 @@ function closeProfile() {
   document.body.classList.remove('modal-open');
 }
 
+async function saveProfileUsername() {
+  const username = document.getElementById('profileUsername').value.trim();
+  const msgEl = document.getElementById('profileUsernameMsg');
+  msgEl.textContent = '';
+  msgEl.className = 'profile-msg';
+  if (!username) {
+    msgEl.textContent = 'Username is required.';
+    msgEl.classList.add('error');
+    return;
+  }
+  if (username.length < 2) {
+    msgEl.textContent = 'Username must be at least 2 characters.';
+    msgEl.classList.add('error');
+    return;
+  }
+  try {
+    const res = await fetch('/api/auth/profile', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      msgEl.textContent = data.error || 'Failed to save username.';
+      msgEl.classList.add('error');
+    } else {
+      if (currentUser) currentUser.username = data.username || username;
+      document.getElementById('profileUsernameDisplay').textContent = currentUser?.username || '';
+      document.getElementById('userDisplay').textContent = currentUser?.username || '';
+      msgEl.textContent = 'Username saved.';
+      msgEl.classList.add('success');
+    }
+  } catch {
+    msgEl.textContent = 'Connection error.';
+    msgEl.classList.add('error');
+  }
+}
+
 async function saveProfileEmail() {
   const email = document.getElementById('profileEmail').value.trim();
   const msgEl = document.getElementById('profileEmailMsg');
   msgEl.textContent = '';
   msgEl.className   = 'profile-msg';
+  if (!email) {
+    msgEl.textContent = 'Email address is required.';
+    msgEl.classList.add('error');
+    return;
+  }
   try {
     const res  = await fetch('/api/auth/profile', {
       method:  'PATCH',
@@ -1087,7 +1642,16 @@ async function saveProfileEmail() {
       msgEl.textContent = data.error || 'Failed to save email';
       msgEl.classList.add('error');
     } else {
-      msgEl.textContent = 'Email saved.';
+      if (currentUser) {
+        currentUser.email = data.email || email;
+        currentUser.emailVerified = data.emailVerified === true;
+        currentUser.gravatarUrl = data.gravatarUrl || currentUser.gravatarUrl || null;
+      }
+      _renderProfileEmailVerification(currentUser);
+      _refreshCurrentUserAvatars(data);
+      msgEl.textContent = data.verificationEmailSent
+        ? 'Email saved. Verification email sent.'
+        : (data.emailVerified === false ? 'Email saved. Verification is still required.' : 'Email saved.');
       msgEl.classList.add('success');
     }
   } catch {
@@ -1096,16 +1660,42 @@ async function saveProfileEmail() {
   }
 }
 
+async function resendProfileVerificationEmail() {
+  const msgEl = document.getElementById('profileEmailMsg');
+  msgEl.textContent = '';
+  msgEl.className = 'profile-msg';
+  try {
+    const res = await fetch('/api/auth/resend-verification', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) {
+      msgEl.textContent = data.error || 'Failed to send verification email.';
+      msgEl.classList.add('error');
+      return;
+    }
+    if (data.alreadyVerified) {
+      if (currentUser) currentUser.emailVerified = true;
+      _renderProfileEmailVerification(currentUser);
+      msgEl.textContent = 'Your email is already verified.';
+      msgEl.classList.add('success');
+      return;
+    }
+    msgEl.textContent = 'Verification email sent. Please check your inbox.';
+    msgEl.classList.add('success');
+  } catch {
+    msgEl.textContent = 'Connection error.';
+    msgEl.classList.add('error');
+  }
+}
+
 async function saveProfilePassword() {
-  const currentPw = document.getElementById('profileCurrentPw').value;
   const newPw     = document.getElementById('profileNewPw').value;
   const confirmPw = document.getElementById('profileConfirmPw').value;
   const msgEl     = document.getElementById('profilePwMsg');
   msgEl.textContent = '';
   msgEl.className   = 'profile-msg';
 
-  if (!currentPw || !newPw || !confirmPw) {
-    msgEl.textContent = 'All password fields are required.';
+  if (!newPw || !confirmPw) {
+    msgEl.textContent = 'Both password fields are required.';
     msgEl.classList.add('error');
     return;
   }
@@ -1114,8 +1704,9 @@ async function saveProfilePassword() {
     msgEl.classList.add('error');
     return;
   }
-  if (newPw.length < 6) {
-    msgEl.textContent = 'New password must be at least 6 characters.';
+  const strength = _evaluatePasswordStrength(newPw);
+  if (!strength.valid) {
+    msgEl.textContent = _passwordPolicyError('New password');
     msgEl.classList.add('error');
     return;
   }
@@ -1124,7 +1715,7 @@ async function saveProfilePassword() {
     const res  = await fetch('/api/auth/profile', {
       method:  'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ currentPassword: currentPw, newPassword: newPw }),
+      body:    JSON.stringify({ newPassword: newPw }),
     });
     const data = await res.json();
     if (!res.ok) {
@@ -1133,9 +1724,9 @@ async function saveProfilePassword() {
     } else {
       msgEl.textContent = 'Password changed successfully.';
       msgEl.classList.add('success');
-      document.getElementById('profileCurrentPw').value = '';
       document.getElementById('profileNewPw').value     = '';
       document.getElementById('profileConfirmPw').value  = '';
+      _renderPasswordStrength('profileNewPasswordStrength', '');
     }
   } catch {
     msgEl.textContent = 'Connection error.';
@@ -1199,6 +1790,17 @@ async function saveProfileGlobalEmail(enabled) {
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({ globalEmailNotify: enabled }),
     });
+  } catch {}
+}
+
+async function saveProfileDisableAiSummary(disabled) {
+  try {
+    await fetch('/api/auth/profile', {
+      method:  'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ disableAiSummary: disabled }),
+    });
+    if (currentUser) currentUser.disableAiSummary = disabled;
   } catch {}
 }
 
@@ -1291,16 +1893,13 @@ function connectSSE() {
         data.trackers.forEach(t => { if (!existingIds.has(t.id)) trackers.unshift(t); });
       }
       if (data.type === 'update') {
-        // Invalidate cache when a tracker gains a new change — either a fresh
-        // transition to 'changed', or an additional change while already 'changed'
-        // (e.g. a new check fires while a dismiss is in-flight, leaving the cache
-        // stale with all-dismissed items that would incorrectly hide the tracker).
+        // Invalidate cache when history grows, regardless of tracker status.
+        // This covers soft/auto-read changes too, so new entries appear
+        // immediately in History without requiring a full page reload.
         trackers.forEach(t => {
-          const isNewChange = t.status === 'changed' && (
-            prevStatuses[t.id] !== 'changed' ||
-            (t.changeCount || 0) > prevChangeCounts[t.id]
-          );
-          if (isNewChange) delete _tcCache[t.id];
+          const prevCount = prevChangeCounts[t.id] || 0;
+          const newCount  = t.changeCount || 0;
+          if (newCount > prevCount) delete _tcCache[t.id];
         });
       }
       renderTrackers();
@@ -1320,6 +1919,8 @@ function connectSSE() {
     }
   };
   evtSource.onerror = async () => {
+    if (_sseProbePending) return;
+    _sseProbePending = true;
     // Check if the session is now blocked by maintenance mode
     try {
       const probe = await fetch('/api/auth/me');
@@ -1332,6 +1933,9 @@ function connectSSE() {
         return;
       }
     } catch {}
+    finally {
+      _sseProbePending = false;
+    }
     setTimeout(() => { if (currentUser) connectSSE(); }, 5000);
   };
 }
@@ -1345,12 +1949,13 @@ function toggleEdit(id) {
 async function saveEdit(id) {
   const t = trackers.find(t => t.id === id);
   if (!t) return;
+  const wasVisible = _trackerMatchesViewFilters(t, false);
   const newLabel    = document.getElementById(`edit-label-${id}`).value.trim();
   const newInterval = parseInt(document.getElementById(`edit-interval-${id}`).value);
   const newAi       = document.getElementById(`edit-ai-${id}`).checked;
   const newEmail    = document.getElementById(`edit-email-${id}`).checked;
   const body = {};
-  if (newLabel && newLabel !== t.label) body.label = newLabel;
+  if (newLabel !== t.label) body.label = newLabel;
   if (newInterval && newInterval !== t.interval) body.interval = newInterval;
   body.aiSummary  = newAi;
   body.emailNotify = newEmail;
@@ -1361,7 +1966,18 @@ async function saveEdit(id) {
       body: JSON.stringify(body)
     });
     if (!res.ok) { showSnackbar('Failed to save changes', 'error'); return; }
+    // Apply saved values locally so filtered views update immediately even if
+    // SSE delivery is delayed.
+    if (newLabel !== t.label) t.label = newLabel;
+    if (newInterval) t.interval = newInterval;
+    t.aiSummary   = newAi;
+    t.emailNotify = newEmail;
     editingId = null;
+    const didFilterOut = _tcMaybeHandleFilteredOutTracker(id, wasVisible);
+    if (!didFilterOut) {
+      renderTrackers();
+      updateBadge();
+    }
     showSnackbar('✓ Changes saved.');
   } catch {
     showSnackbar('Connection error', 'error');
@@ -1386,6 +2002,8 @@ async function addTracker() {
     if (!res.ok) { const d = await res.json(); showSnackbar(d.error || 'Failed to add', 'error'); return; }
     document.getElementById('urlInput').value   = '';
     document.getElementById('labelInput').value = '';
+    const intervalEl = document.getElementById('intervalSelect');
+    if (intervalEl?.options?.length) intervalEl.value = intervalEl.options[0].value;
     document.getElementById('addAiSummary').checked  = false;
     document.getElementById('addEmailNotify').checked = false;
   } catch {
@@ -1411,10 +2029,14 @@ async function removeTracker(id) {
 async function toggleTracker(id) {
   const t = trackers.find(t => t.id === id);
   if (!t) return;
+  const wasVisible = _trackerMatchesViewFilters(t, false);
   // Optimistic update
   t.active = !t.active;
-  renderTrackers();
-  updateBadge();
+  const didFilterOut = _tcMaybeHandleFilteredOutTracker(id, wasVisible);
+  if (!didFilterOut) {
+    renderTrackers();
+    updateBadge();
+  }
   try {
     await fetch(`/api/trackers/${id}`, {
       method: 'PATCH',
@@ -1422,6 +2044,7 @@ async function toggleTracker(id) {
       body: JSON.stringify({ active: t.active })
     });
   } catch {
+    if (didFilterOut) _tcCancelFilterOutAnimation(id);
     t.active = !t.active; // revert
     renderTrackers();
     updateBadge();
@@ -1432,25 +2055,87 @@ async function toggleTracker(id) {
 // ─── CHECK ────────────────────────────────────────────────────────────────────
 async function checkTracker(id) {
   const t = trackers.find(t => t.id === id);
+  const prevStatus = t?.status;
+  const prevCount  = Number(t?.changeCount || 0);
+  const wasVisible = t ? _trackerMatchesViewFilters(t, false) : false;
+  let didFilterOut = false;
   if (t) { t.status = 'checking'; renderTrackers(); }
   try {
-    await fetch(`/api/trackers/${id}/check`, { method: 'POST' });
+    const res = await fetch(`/api/trackers/${id}/check`, { method: 'POST' });
+    if (!res.ok) throw new Error('check failed');
+    const updated = await res.json();
+    const idx = trackers.findIndex(x => x.id === id);
+    if (idx >= 0) {
+      trackers[idx] = { ...trackers[idx], ...updated };
+      const nextCount = Number(updated.changeCount || 0);
+      const hasNewHistory = nextCount > prevCount;
+      const likelyHasFreshTopEntry = updated.status === 'changed';
+      if (hasNewHistory || likelyHasFreshTopEntry) {
+        // Manual checks should reveal the latest update without requiring
+        // an extra expand click by the user.
+        if (_tcCollapsed.has(id)) {
+          _tcCollapsed.delete(id);
+          _tcCollapseSave();
+        }
+        delete _tcCache[id];
+        // Proactively reload top history for this tracker so first manual click
+        // always reflects fresh entries even if SSE timing is delayed.
+        _tcFetch(id);
+      }
+      didFilterOut = _tcMaybeHandleFilteredOutTracker(id, wasVisible);
+      if (!didFilterOut) {
+        renderTrackers();
+        updateBadge();
+      }
+    }
   } catch {
+    if (didFilterOut) _tcCancelFilterOutAnimation(id);
+    if (t) {
+      t.status = prevStatus || 'ok';
+      renderTrackers();
+    }
     showSnackbar('Connection error', 'error');
   }
 }
 
 async function checkAll() {
   const btn = document.getElementById('checkAllBtn');
+  if (!btn) return;
+  const idleTip = btn.dataset.tip || 'Check now (Active only)';
   btn.disabled = true;
-  btn.title = 'Checking…';
+  btn.dataset.tip = 'Checking…';
+  btn.removeAttribute('title');
   btn.innerHTML = '<span class="material-icons" style="font-size:20px;animation:spin 0.7s linear infinite;display:inline-block">refresh</span>';
   try {
-    await Promise.all(
-      trackers.filter(t => t.active).map(t => fetch(`/api/trackers/${t.id}/check`, { method: 'POST' }))
+    const activeTrackers = trackers.filter(t => t.active);
+    const results = await Promise.allSettled(
+      activeTrackers.map(async t => {
+        const prevCount = t.changeCount || 0;
+        const res = await fetch(`/api/trackers/${t.id}/check`, { method: 'POST' });
+        if (!res.ok) throw new Error('check failed');
+        const updated = await res.json();
+        return { id: t.id, prevCount, updated };
+      })
     );
+
+    let didMerge = false;
+    results.forEach(r => {
+      if (r.status !== 'fulfilled') return;
+      const { id, prevCount, updated } = r.value;
+      const idx = trackers.findIndex(x => x.id === id);
+      if (idx < 0) return;
+      trackers[idx] = { ...trackers[idx], ...updated };
+      if ((updated.changeCount || 0) > prevCount) delete _tcCache[id];
+      didMerge = true;
+    });
+    if (didMerge) {
+      renderTrackers();
+      updateBadge();
+    }
   } finally {
     btn.disabled = false;
+    btn.dataset.tip = idleTip;
+    btn.removeAttribute('title');
     btn.innerHTML = '<span class="material-icons" style="font-size:20px">refresh</span>';
   }
 }
@@ -1513,11 +2198,14 @@ function _tcBuildHTML(t, cache) {
     <button class="tc-icon-btn tc-icon-btn-delete" data-tip="Delete all unflagged history" onclick="_tcDeleteHistory('${t.id}')" style="margin-left:16px">
       <span class="material-icons">delete_outline</span>
     </button>
+    <span class="tc-header-hotspot" onclick="_tcToggleHistory('${t.id}')"></span>
     <button class="tc-icon-btn tc-flag-filter-btn${_tcFlagFilter.has(t.id) ? ' tc-flag-filter-btn-active' : ''}" data-tip="${_tcFlagFilter.has(t.id) ? 'Show all entries' : 'Show flagged only'}" onclick="_tcToggleFlagFilter('${t.id}')">
       <span class="material-icons">${_tcFlagFilter.has(t.id) ? 'flag' : 'outlined_flag'}</span>
     </button>
-    <span class="tc-header-hotspot" onclick="_tcToggleHistory('${t.id}')"></span>
-    ${showUnreadBadge && unreadCount > 0 ? `<button class="btn btn-text tc-mark-all-read-btn" onclick="_tcDismissAll('${t.id}')">Mark all read</button>` : ''}
+    <button class="tc-icon-btn tc-unread-filter-btn${_tcUnreadFilter.has(t.id) ? ' tc-unread-filter-btn-active' : ''}" data-tip="${_tcUnreadFilter.has(t.id) ? 'Show all entries' : 'Show unread only'}" onclick="_tcToggleUnreadFilter('${t.id}')">
+      <span class="material-icons">${_tcUnreadFilter.has(t.id) ? 'mark_email_read' : 'mark_email_unread'}</span>
+    </button>
+    ${showUnreadBadge && unreadCount > 0 ? `<span class="tc-header-divider tc-header-divider-mark-read" aria-hidden="true"></span><button class="btn btn-text tc-mark-all-read-btn" onclick="_tcDismissAll('${t.id}')">Mark all read</button>` : ''}
     ${showUnreadBadge ? `<span class="tc-unread-badge" style="margin-right:8px">${badgeLabel}</span>` : ''}
     <button class="tc-icon-btn tc-toggle-history-btn" data-tip="${toggleTitle}" onclick="_tcToggleHistory('${t.id}')">
       <span class="material-icons tc-toggle-btn-icon">${toggleIcon}</span>
@@ -1557,11 +2245,18 @@ function _tcBuildHTML(t, cache) {
 
   // Cache is loaded — render stacked history entries (newest first).
   // Apply active filter to entries too.
-  const perTrackerFlagFilter = _tcFlagFilter.has(t.id);
+  const perTrackerFlagFilter   = _tcFlagFilter.has(t.id);
+  const perTrackerUnreadFilter  = _tcUnreadFilter.has(t.id);
   const visibleItems = cache.items.filter(i => {
-    if (perTrackerFlagFilter)                  return !!i.flagged;
+    // Per-tracker filters take precedence — they are independent of global filters.
+    // When both per-tracker filters are active they must AND together.
+    if (perTrackerFlagFilter || perTrackerUnreadFilter) {
+      const flagOk   = !perTrackerFlagFilter  || !!i.flagged;
+      const unreadOk = !perTrackerUnreadFilter || !i.dismissed;
+      return flagOk && unreadOk;
+    }
+    // No per-tracker filter — apply global filters (union).
     if (!showChangedOnly && !showFlaggedOnly)  return true;
-    // Union: entry is shown if it satisfies any active filter
     if (showChangedOnly && !i.dismissed) return true;
     if (showFlaggedOnly  && i.flagged)   return true;
     return false;
@@ -1576,7 +2271,7 @@ function _tcBuildHTML(t, cache) {
       <div class="tc-entry-row">
         ${entryUnread ? `<span class="tc-unread-dot" data-tip="Unread"></span>` : '<span class="tc-read-dot" data-tip="Read"></span>'}
         <div class="tc-entry-meta">${timeAgo(item.detectedAt)} &middot; ${dateStr}</div>
-        ${entrySoft ? `<span class="tc-soft-chip">no sig. change</span>` : ''}
+        ${entrySoft ? `<span class="tc-soft-chip" data-tip="A difference was detected, but content appears essentially unchanged.">no sig. change</span>` : ''}
         <span style="flex:1"></span>
         ${entryUnread ? `<button class="btn btn-text tc-mark-read-btn" onclick="_tcDismissChange('${item.id}','${t.id}')">Mark read</button>` : `<span class="tc-read-label">${entrySoft ? 'Read (auto)' : 'Read'}</span>`}
         <button class="tc-icon-btn tc-flag-btn${item.flagged ? ' tc-flag-btn-active' : ''}" data-tip="${item.flagged ? 'Unflag this change' : 'Flag this change'}" onclick="_tcFlagChange('${item.id}','${t.id}')">
@@ -1584,6 +2279,7 @@ function _tcBuildHTML(t, cache) {
         </button>
       </div>
       <div class="diff-summary">${renderSummary(item.summary || '')}</div>
+      ${item.aiDisabledReason ? _aiDisabledLabel(item.aiDisabledReason) : ''}
       ${hasSnippet ? `<button class="btn btn-text" style="padding:3px 10px;font-size:12px;white-space:nowrap" onclick="toggleDiffPanel('${item.id}',this)">Show changes</button>` : ''}
     </div>
     ${hasSnippet ? `<div class="diff-panel" id="diff-panel-${item.id}">
@@ -1594,7 +2290,7 @@ function _tcBuildHTML(t, cache) {
     </div>` : ''}`;
   });
 
-  if (!showChangedOnly && !showFlaggedOnly && !_tcFlagFilter.has(t.id) && cache.total > cache.items.length) {
+  if (!showChangedOnly && !showFlaggedOnly && !_tcFlagFilter.has(t.id) && !_tcUnreadFilter.has(t.id) && cache.total > cache.items.length) {
     const remaining = Math.min(5, cache.total - cache.items.length);
     html += `<button class="btn btn-text tc-load-more" onclick="_tcLoadMore('${t.id}')">Load ${remaining} more change${remaining !== 1 ? 's' : ''}</button>`;
   }
@@ -1666,26 +2362,88 @@ function _tcLoadMore(trackerId) {
 }
 
 async function _tcDismissAll(trackerId) {
+  const tracker = trackers.find(t => t.id === trackerId);
+  const wasVisible = tracker ? _trackerMatchesViewFilters(tracker, false) : false;
   const cache = _tcCache[trackerId];
   const unread = cache?.items.filter(i => !i.dismissed) ?? [];
   // Optimistic update
   unread.forEach(i => { i.dismissed = 1; });
   _tcUpdate(trackerId);
+  const didFilterOut = _tcMaybeHandleFilteredOutTracker(trackerId, wasVisible);
   try {
     await fetch(`/api/trackers/${trackerId}/dismiss`, { method: 'POST' });
     // SSE will update tracker.status
   } catch {
+    if (didFilterOut) _tcCancelFilterOutAnimation(trackerId);
     // Revert
     unread.forEach(i => { i.dismissed = 0; });
-    _tcUpdate(trackerId);
+    if (didFilterOut) {
+      renderTrackers();
+      updateBadge();
+    } else {
+      _tcUpdate(trackerId);
+    }
     showSnackbar('Failed to mark changes as read', 'error');
   }
+}
+
+function _tcQueueFilterOutAnimation(trackerId, wasVisible) {
+  if (!_hasTrackerViewFilter()) return false;
+  if (!wasVisible) return false;
+  const tracker = trackers.find(t => t.id === trackerId);
+  if (!tracker) return false;
+  if (_trackerMatchesViewFilters(tracker, false)) return false;
+  if (_tcPendingHideAnim.size > 0) return false;
+  const row = document.querySelector(`.tracker-item[data-id="${trackerId}"]`);
+  if (!row) return false;
+  const trackerLabel = tracker.label || 'Tracker';
+
+  _tcPendingHideAnim.add(trackerId);
+  requestAnimationFrame(() => row.classList.add('tracker-item-filter-out'));
+
+  const timer = setTimeout(() => {
+    _tcPendingHideTimers.delete(trackerId);
+    _tcPendingHideAnim.delete(trackerId);
+    renderTrackers();
+    if (_TC_FILTER_OUT_TOAST_ENABLED) {
+      showSnackbar(`${trackerLabel} hidden by current filter`, undefined, 1800);
+    }
+  }, _TC_FILTER_OUT_ANIM_MS);
+
+  _tcPendingHideTimers.set(trackerId, timer);
+  return true;
+}
+
+function _tcMaybeHandleFilteredOutTracker(trackerId, wasVisible) {
+  const tracker = trackers.find(t => t.id === trackerId);
+  if (!tracker || !wasVisible) return false;
+  if (_trackerMatchesViewFilters(tracker, false)) return false;
+  const animated = _tcQueueFilterOutAnimation(trackerId, wasVisible);
+  if (!animated) {
+    renderTrackers();
+    updateBadge();
+  }
+  return true;
+}
+
+function _tcCancelFilterOutAnimation(trackerId) {
+  const timer = _tcPendingHideTimers.get(trackerId);
+  if (timer) {
+    clearTimeout(timer);
+    _tcPendingHideTimers.delete(trackerId);
+  }
+  _tcPendingHideAnim.delete(trackerId);
+  const row = document.querySelector(`.tracker-item[data-id="${trackerId}"]`);
+  if (row) row.classList.remove('tracker-item-filter-out');
 }
 
 async function _tcFlagChange(changeId, trackerId) {
   const cache = _tcCache[trackerId];
   const item  = cache?.items.find(i => i.id === changeId);
   if (!item) return;
+  const tracker = trackers.find(t => t.id === trackerId);
+  const wasVisible = tracker ? _trackerMatchesViewFilters(tracker, false) : false;
+  let didFilterOut = false;
   const wasFlagged = !!item.flagged;
   const newFlagged = !wasFlagged;
   // If a flag-based filter is active, toggling visibility requires a full rebuild.
@@ -1697,6 +2455,7 @@ async function _tcFlagChange(changeId, trackerId) {
   } else {
     _tcPatchFlagDOM(trackerId, changeId, item);
   }
+  didFilterOut = _tcMaybeHandleFilteredOutTracker(trackerId, wasVisible);
   try {
     const res = await fetch(`/api/changes/${changeId}/flag`, { method: 'POST' });
     if (!res.ok) throw new Error();
@@ -1704,13 +2463,22 @@ async function _tcFlagChange(changeId, trackerId) {
     item.flagged = flagged ? 1 : 0;
     // Only rebuild if server returned something different from our optimistic value
     if ((!!flagged) !== newFlagged) {
+      if (didFilterOut) _tcCancelFilterOutAnimation(trackerId);
       if (filterActive) _tcUpdate(trackerId);
       else _tcPatchFlagDOM(trackerId, changeId, item);
+      _tcMaybeHandleFilteredOutTracker(trackerId, wasVisible);
     }
   } catch {
+    if (didFilterOut) _tcCancelFilterOutAnimation(trackerId);
     item.flagged = wasFlagged ? 1 : 0;
-    if (filterActive) _tcUpdate(trackerId);
-    else _tcPatchFlagDOM(trackerId, changeId, item);
+    if (didFilterOut) {
+      renderTrackers();
+      updateBadge();
+    } else if (filterActive) {
+      _tcUpdate(trackerId);
+    } else {
+      _tcPatchFlagDOM(trackerId, changeId, item);
+    }
     showSnackbar('Failed to update flag', 'error');
   }
 }
@@ -1737,15 +2505,31 @@ function _tcPatchFlagDOM(trackerId, changeId, item) {
 async function _tcDismissChange(changeId, trackerId) {
   const cache = _tcCache[trackerId];
   const item  = cache?.items.find(i => i.id === changeId);
+  const tracker = trackers.find(t => t.id === trackerId);
+  const wasVisible = tracker ? _trackerMatchesViewFilters(tracker, false) : false;
+  let didFilterOut = false;
   // Optimistic update
-  if (item) { item.dismissed = 1; _tcUpdate(trackerId); }
+  if (item) {
+    item.dismissed = 1;
+    _tcUpdate(trackerId);
+    didFilterOut = _tcMaybeHandleFilteredOutTracker(trackerId, wasVisible);
+  }
   try {
     const res = await fetch(`/api/changes/${changeId}/dismiss`, { method: 'POST' });
     if (!res.ok) throw new Error();
     // SSE will update tracker.status if all changes are now dismissed
   } catch {
+    if (didFilterOut) _tcCancelFilterOutAnimation(trackerId);
     // Revert optimistic update
-    if (item) { item.dismissed = 0; _tcUpdate(trackerId); }
+    if (item) {
+      item.dismissed = 0;
+      if (didFilterOut) {
+        renderTrackers();
+        updateBadge();
+      } else {
+        _tcUpdate(trackerId);
+      }
+    }
     showSnackbar('Failed to mark change as read', 'error');
   }
 }
@@ -1755,6 +2539,15 @@ function _tcToggleFlagFilter(id) {
     _tcFlagFilter.delete(id);
   } else {
     _tcFlagFilter.add(id);
+  }
+  _tcUpdate(id);
+}
+
+function _tcToggleUnreadFilter(id) {
+  if (_tcUnreadFilter.has(id)) {
+    _tcUnreadFilter.delete(id);
+  } else {
+    _tcUnreadFilter.add(id);
   }
   _tcUpdate(id);
 }
@@ -1862,14 +2655,6 @@ function toggleDiffPanel(id, btn) {
   btn.textContent = isOpen ? 'Hide changes' : 'Show changes';
 }
 
-async function dismissChange(id) {
-  try {
-    await fetch(`/api/trackers/${id}/dismiss`, { method: 'POST' });
-  } catch {
-    showSnackbar('Connection error', 'error');
-  }
-}
-
 async function dismissAll() {
   const changed = trackers.filter(t => t.status === 'changed');
   if (!changed.length) return;
@@ -1914,7 +2699,7 @@ function confirmMarkAllRead() {
     _markAllReadKeyHandler = (e) => { if (e.key === 'Escape') _closeMarkAllReadModal(false); };
     document.addEventListener('keydown', _markAllReadKeyHandler);
     setTimeout(() => cancelBtn.focus(), 0);
-  }).then(confirmed => { if (confirmed) dismissAll(); });
+  }).then(async confirmed => { if (confirmed) await dismissAll(); });
 }
 
 function _closeMarkAllReadModal(confirmed) {
@@ -1936,42 +2721,48 @@ function _closeMarkAllReadModal(confirmed) {
   }
 }
 
+function _hasTrackerViewFilter() {
+  return !!trackerFilter || showChangedOnly || showActiveOnly || showAIOnly || showFlaggedOnly;
+}
+
+function _trackerMatchesViewFilters(t, includePendingAnim = true) {
+  // Keep a tracker visible for a brief moment while its filter-out animation plays.
+  if (includePendingAnim && _tcPendingHideAnim.has(t.id)) return true;
+  if (showActiveOnly  && !t.active)             return false;
+  if (showAIOnly      && t.aiSummary === false) return false;
+  if (trackerFilter &&
+      !(t.label || '').toLowerCase().includes(trackerFilter) &&
+      !(t.url   || '').toLowerCase().includes(trackerFilter)) return false;
+  // Unread / flagged filters: use loaded cache for precision; fall back to tracker-level counters.
+  if (showChangedOnly || showFlaggedOnly) {
+    const cache = _tcCache[t.id];
+    if (cache?.loaded) {
+      const hasMatch = cache.items.some(i =>
+        (showChangedOnly && !i.dismissed) || (showFlaggedOnly && i.flagged)
+      );
+      if (!hasMatch) return false;
+    } else {
+      if (!(
+        (showChangedOnly && t.status === 'changed') ||
+        (showFlaggedOnly  && t.flaggedCount > 0)
+      )) return false;
+    }
+  }
+  return true;
+}
+
 // ─── RENDER ───────────────────────────────────────────────────────────────────
 function renderTrackers() {
   const list = document.getElementById('trackerList');
 
-  const filtered = trackers.filter(t => {
-    if (showActiveOnly  && !t.active)            return false;
-    if (showAIOnly      && t.aiSummary === false) return false;
-    if (trackerFilter &&
-        !(t.label || '').toLowerCase().includes(trackerFilter) &&
-        !(t.url   || '').toLowerCase().includes(trackerFilter)) return false;
-    // Unread / locked filters: use loaded cache for precision; fall back to tracker-level counters
-    if (showChangedOnly || showFlaggedOnly) {
-      const cache = _tcCache[t.id];
-      if (cache?.loaded) {
-        // Tracker visible if any entry satisfies any active filter (OR)
-        const hasMatch = cache.items.some(i =>
-          (showChangedOnly && !i.dismissed) || (showFlaggedOnly && i.flagged)
-        );
-        if (!hasMatch) return false;
-      } else {
-        // Cache not yet loaded — use coarse proxy flags (OR)
-        if (!(
-          (showChangedOnly && t.status === 'changed') ||
-          (showFlaggedOnly  && t.flaggedCount > 0)
-        )) return false;
-      }
-    }
-    return true;
-  });
+  const filtered = trackers.filter(t => _trackerMatchesViewFilters(t));
 
   // Update the filter count badge
   const countEl = document.getElementById('trackerFilterCount');
   if (countEl) {
     if (trackers.length === 0) {
       countEl.textContent = '';
-    } else if (trackerFilter || showChangedOnly || showActiveOnly || showAIOnly || showFlaggedOnly) {
+    } else if (_hasTrackerViewFilter()) {
       countEl.textContent = `${filtered.length} of ${trackers.length} shown`;
     } else {
       countEl.textContent = `${trackers.length} tracker${trackers.length !== 1 ? 's' : ''}`;
@@ -2020,6 +2811,9 @@ function renderTrackers() {
     el.draggable = false;
     el.innerHTML = trackerHTML(t);
     list.appendChild(el);
+    if (_tcPendingHideAnim.has(t.id)) {
+      requestAnimationFrame(() => el.classList.add('tracker-item-filter-out'));
+    }
     // Restore scroll immediately after element is in DOM
     if (savedScrolls.has(t.id)) {
       const body = el.querySelector('.tc-body');
@@ -2080,8 +2874,23 @@ function setTrackerFilter(val) {
   renderTrackers();
 }
 
+function _expandHistoryForGlobalChangeFilters() {
+  // Only applies to global "Show unread" / "Show flagged" views.
+  if (!showChangedOnly && !showFlaggedOnly) return;
+  let changed = false;
+  trackers.forEach(t => {
+    if (!_trackerMatchesViewFilters(t, false)) return;
+    if (_tcCollapsed.has(t.id)) {
+      _tcCollapsed.delete(t.id);
+      changed = true;
+    }
+  });
+  if (changed) _tcCollapseSave();
+}
+
 function setShowChangedOnly(checked) {
   showChangedOnly = checked;
+  if (showChangedOnly || showFlaggedOnly) _expandHistoryForGlobalChangeFilters();
   renderTrackers();
 }
 
@@ -2097,6 +2906,7 @@ function setShowAIOnly(checked) {
 
 function setShowFlaggedOnly(checked) {
   showFlaggedOnly = checked;
+  if (showChangedOnly || showFlaggedOnly) _expandHistoryForGlobalChangeFilters();
   renderTrackers();
 }
 
@@ -2235,7 +3045,7 @@ function trackerHTML(t) {
         <div class="tracker-last-check">${lastCheck}</div>
         ${timeAgoStr ? `<div class="tracker-time-ago" data-ts="${t.lastCheck}">${timeAgoStr}</div>` : ''}
         <div data-tip="${t.aiSummary !== false ? 'AI summary enabled' : 'AI summary disabled'}" style="display:flex;align-items:center;gap:3px;font-size:11px;${t.aiSummary !== false ? 'color:var(--primary);opacity:0.75' : 'color:var(--on-surface-medium);opacity:0.45'}">
-          <span class="material-icons" style="font-size:13px">${t.aiSummary !== false ? 'auto_awesome' : 'auto_awesome'}</span>AI
+          <span class="material-icons" style="font-size:13px">auto_awesome</span>AI
         </div>
         ${t.emailNotify ? `<div data-tip="Email notifications enabled" style="display:flex;align-items:center;gap:3px;font-size:11px;color:var(--primary);opacity:0.75"><span class="material-icons" style="font-size:13px">email</span></div>` : ''}
       </div>
@@ -2261,19 +3071,7 @@ function trackerHTML(t) {
         <div class="field">
           <label>Check every</label>
           <select id="edit-interval-${t.id}">
-            <option value="10000"   ${t.interval===10000   ?'selected':''}>10 seconds</option>
-            <option value="30000"   ${t.interval===30000   ?'selected':''}>30 seconds</option>
-            <option value="60000"   ${t.interval===60000   ?'selected':''}>1 minute</option>
-            <option value="300000"  ${t.interval===300000  ?'selected':''}>5 minutes</option>
-            <option value="600000"  ${t.interval===600000  ?'selected':''}>10 minutes</option>
-            <option value="1800000" ${t.interval===1800000 ?'selected':''}>30 minutes</option>
-            <option value="3600000" ${t.interval===3600000 ?'selected':''}>1 hour</option>
-            <option value="14400000"${t.interval===14400000?'selected':''}>4 hours</option>
-            <option value="21600000"${t.interval===21600000?'selected':''}>6 hours</option>
-            <option value="43200000"${t.interval===43200000?'selected':''}>12 hours</option>
-            <option value="86400000" ${t.interval===86400000 ?'selected':''}>24 hours</option>
-            <option value="259200000"${t.interval===259200000?'selected':''}>3 days</option>
-            <option value="604800000"${t.interval===604800000?'selected':''}>7 days</option>
+            ${_intervalOptionsHTML(_getIntervalOptions(), t.interval)}
           </select>
         </div>
         <label class="ai-checkbox-row" data-tip="When disabled, changes are still detected but no AI summary is generated">
@@ -2495,7 +3293,7 @@ function _renderAISuggestions(query) {
   const totalDesc = aiCategoryFilter
     ? `${filtered.length} ${aiCategoryFilter} result${filtered.length !== 1 ? 's' : ''} of ${aiSuggestions.length} total`
     : `${aiSuggestions.length} suggestion${aiSuggestions.length !== 1 ? 's' : ''}`;
-  title.textContent = `Showing ${shown.length} of ${totalDesc} for "${escHtml(query)}"`;
+  title.textContent = `Showing ${shown.length} of ${totalDesc} for "${query}"`;
 
   const itemsHtml = shown.map((s) => {
     const origIdx  = aiSuggestions.indexOf(s);
@@ -2651,14 +3449,14 @@ async function _addSelectedTrackers(selected) {
 }
 
 let snackTimer;
-function showSnackbar(msg, type) {
+function showSnackbar(msg, type, durationMs = 5000) {
   const bar  = document.getElementById('snackbar');
   const icon = bar.querySelector('.material-icons');
   icon.textContent = type === 'error' ? 'error_outline' : 'notifications';
   document.getElementById('snackbarText').textContent = msg;
   bar.classList.add('show');
   clearTimeout(snackTimer);
-  snackTimer = setTimeout(hideSnackbar, 5000);
+  snackTimer = setTimeout(hideSnackbar, durationMs);
 }
 function hideSnackbar() {
   document.getElementById('snackbar').classList.remove('show');
@@ -2693,6 +3491,16 @@ setInterval(() => {
 
 function escHtml(str) {
   return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function _aiDisabledLabel(reason) {
+  if (!reason) return '';
+  const text = reason === 'admin'   ? 'AI summary disabled by Admin'
+             : reason === 'user'    ? 'AI summary disabled by User'
+             : reason === 'tracker' ? 'AI summary disabled for this bot'
+             : '';
+  if (!text) return '';
+  return `<span class="tc-ai-disabled-note">${text}</span>`;
 }
 
 // Render AI summary text: supports markdown bullets (- / * / •), bold (**text**), and newlines

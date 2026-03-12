@@ -33,6 +33,10 @@
     <button class="btn-icon" onclick="openProfile()" data-tip="Account settings" style="color:var(--on-surface-medium)">
       <span class="material-icons" style="font-size:20px">manage_accounts</span>
     </button>
+    <div class="user-avatar-chip" id="topbarAvatar" data-tip="Gravatar avatar">
+      <img id="topbarAvatarImg" alt="User avatar" referrerpolicy="no-referrer" />
+      <span class="material-icons" id="topbarAvatarFallback">account_circle</span>
+    </div>
     <button class="btn btn-text" style="padding:6px 10px;font-size:13px" onclick="handleLogout()" data-tip="Sign out">
       <span class="material-icons" style="font-size:16px">logout</span> Sign out
     </button>
@@ -45,7 +49,7 @@
   <div class="card ai-finder-card" id="aiFinderCard">
     <div class="add-card-header collapsible-header" onclick="toggleCardCollapse('aiFinderCard')">
       <span class="material-icons" style="color:#7c4dff">auto_awesome</span>
-      WatchBot Resource Finder
+      RESOURCE FINDER
       <span class="material-icons collapse-chevron" id="aiFinderChevron" style="margin-left:auto;font-size:20px;color:var(--on-surface-medium)">expand_less</span>
     </div>
     <div class="card-collapsible-body" id="aiFinderBody">
@@ -105,19 +109,7 @@
       <div class="field">
         <label>Check every</label>
         <select id="intervalSelect">
-          <option value="10000">10 seconds</option>
-          <option value="30000" selected>30 seconds</option>
-          <option value="60000">1 minute</option>
-          <option value="300000">5 minutes</option>
-          <option value="600000">10 minutes</option>
-          <option value="1800000">30 minutes</option>
-          <option value="3600000">1 hour</option>
-          <option value="14400000">4 hours</option>
-          <option value="21600000">6 hours</option>
-          <option value="43200000">12 hours</option>
-          <option value="86400000">24 hours</option>
-          <option value="259200000">3 days</option>
-          <option value="604800000">7 days</option>
+          <!-- populated by _intervalOptionsHTML() in showApp() based on user role -->
         </select>
       </div>
       <label class="ai-checkbox-row" data-tip="When disabled, changes are still detected but no AI summary is generated">
@@ -216,23 +208,75 @@
       <button class="auth-tab"        data-tab="register" onclick="switchAuthTab('register')">Create account</button>
     </div>
     <p class="auth-error" id="authError" role="alert"></p>
+    <p class="auth-info" id="authInfo" role="status"></p>
     <!-- Login -->
     <form id="loginForm" onsubmit="handleLogin(event)">
       <div class="field">
-        <label for="loginUsername">Username</label>
-        <input type="text" id="loginUsername" placeholder="Enter username" autocomplete="username" required />
+        <label for="loginUsername">Email or username</label>
+        <input type="text" id="loginUsername" placeholder="Enter email or username" autocomplete="username" required />
       </div>
       <div class="field">
         <label for="loginPassword">Password</label>
-        <input type="password" id="loginPassword" placeholder="Enter password" autocomplete="current-password" required />
+        <div class="pw-field-wrap">
+          <input type="password" id="loginPassword" placeholder="Enter password" autocomplete="current-password" required />
+          <button type="button" class="pw-toggle" onclick="_togglePwVisibility('loginPassword',this)" tabindex="-1" aria-label="Show/hide password"><span class="material-icons">visibility</span></button>
+        </div>
+      </div>
+      <div class="auth-inline-row">
+        <button type="button" class="auth-link-btn" onclick="openForgotPassword()">Forgot password?</button>
       </div>
       <button type="submit" class="btn btn-primary" style="width:100%;justify-content:center;margin-top:4px">Sign in</button>
     </form>
+
+    <form id="forgotForm" style="display:none" onsubmit="handleForgotPassword(event)">
+      <div class="field">
+        <label for="forgotEmail">Account email</label>
+        <input type="email" id="forgotEmail" placeholder="your@email.com" autocomplete="email" required />
+      </div>
+      <p class="auth-form-msg" id="forgotMsg"></p>
+      <button type="submit" class="btn btn-primary" style="width:100%;justify-content:center">Send reset link</button>
+      <button type="button" class="btn btn-text" style="width:100%;justify-content:center" onclick="backToLoginFromAuthFlow()">Back to sign in</button>
+    </form>
+
+    <form id="resetForm" style="display:none" onsubmit="handleResetPassword(event)">
+      <div class="field">
+        <label for="resetNewPassword">New password</label>
+        <div class="pw-field-wrap">
+          <input type="password" id="resetNewPassword" placeholder="Use 10+ chars with mixed types" autocomplete="new-password" required />
+          <button type="button" class="pw-toggle" onclick="_togglePwVisibility('resetNewPassword',this)" tabindex="-1" aria-label="Show/hide password"><span class="material-icons">visibility</span></button>
+        </div>
+        <div class="password-strength" id="resetPasswordStrength" aria-live="polite">
+          <div class="password-strength-header">
+            <span>Strength: <strong data-role="label">Weak</strong></span>
+            <span data-role="score">0/5</span>
+          </div>
+          <div class="password-strength-meter"><span data-role="fill"></span></div>
+          <div class="password-strength-rules">
+            <span data-rule="length">10+ chars</span>
+            <span data-rule="upper">Uppercase</span>
+            <span data-rule="lower">Lowercase</span>
+            <span data-rule="number">Number</span>
+            <span data-rule="symbol">Symbol</span>
+          </div>
+        </div>
+      </div>
+      <div class="field">
+        <label for="resetConfirmPassword">Confirm new password</label>
+        <div class="pw-field-wrap">
+          <input type="password" id="resetConfirmPassword" placeholder="Repeat new password" autocomplete="new-password" required />
+          <button type="button" class="pw-toggle" onclick="_togglePwVisibility('resetConfirmPassword',this)" tabindex="-1" aria-label="Show/hide password"><span class="material-icons">visibility</span></button>
+        </div>
+      </div>
+      <p class="auth-form-msg" id="resetMsg"></p>
+      <button type="submit" class="btn btn-primary" style="width:100%;justify-content:center">Reset password</button>
+      <button type="button" class="btn btn-text" style="width:100%;justify-content:center" onclick="backToLoginFromAuthFlow()">Back to sign in</button>
+    </form>
+
     <!-- Register -->
     <form id="registerForm" style="display:none" onsubmit="handleRegister(event)">
       <div class="field">
         <label for="registerUsername">Username</label>
-        <input type="text" id="registerUsername" placeholder="Choose a username (min 3 chars)" autocomplete="username" required />
+        <input type="text" id="registerUsername" placeholder="Choose a username (min 2 chars)" autocomplete="username" required />
       </div>
       <div class="field">
         <label for="registerEmail">Email</label>
@@ -240,11 +284,31 @@
       </div>
       <div class="field">
         <label for="registerPassword">Password</label>
-        <input type="password" id="registerPassword" placeholder="Choose a password (min 6 chars)" autocomplete="new-password" required />
+        <div class="pw-field-wrap">
+          <input type="password" id="registerPassword" placeholder="Use 10+ chars with mixed types" autocomplete="new-password" required />
+          <button type="button" class="pw-toggle" onclick="_togglePwVisibility('registerPassword',this)" tabindex="-1" aria-label="Show/hide password"><span class="material-icons">visibility</span></button>
+        </div>
+        <div class="password-strength" id="registerPasswordStrength" aria-live="polite">
+          <div class="password-strength-header">
+            <span>Strength: <strong data-role="label">Weak</strong></span>
+            <span data-role="score">0/5</span>
+          </div>
+          <div class="password-strength-meter"><span data-role="fill"></span></div>
+          <div class="password-strength-rules">
+            <span data-rule="length">10+ chars</span>
+            <span data-rule="upper">Uppercase</span>
+            <span data-rule="lower">Lowercase</span>
+            <span data-rule="number">Number</span>
+            <span data-rule="symbol">Symbol</span>
+          </div>
+        </div>
       </div>
       <div class="field">
         <label for="registerConfirm">Confirm password</label>
-        <input type="password" id="registerConfirm" placeholder="Repeat password" autocomplete="new-password" required />
+        <div class="pw-field-wrap">
+          <input type="password" id="registerConfirm" placeholder="Repeat password" autocomplete="new-password" required />
+          <button type="button" class="pw-toggle" onclick="_togglePwVisibility('registerConfirm',this)" tabindex="-1" aria-label="Show/hide password"><span class="material-icons">visibility</span></button>
+        </div>
       </div>
       <button type="submit" class="btn btn-primary" style="width:100%;justify-content:center;margin-top:4px">Create account</button>
     </form>
@@ -288,8 +352,25 @@
           </div>
           <div class="field" style="flex:1;min-width:120px;gap:4px">
             <label style="font-size:11px;font-weight:600;color:var(--on-surface-medium);text-transform:uppercase;letter-spacing:0.5px">Password</label>
-            <input type="password" id="adminNewPassword" placeholder="min 6 chars" autocomplete="new-password"
-              style="padding:7px 10px;border:1px solid var(--divider);border-radius:8px;font-size:13px;background:var(--surface);color:var(--on-surface)" />
+            <div class="pw-field-wrap">
+              <input type="password" id="adminNewPassword" placeholder="10+ chars, mixed types" autocomplete="new-password"
+                style="padding:7px 10px;border:1px solid var(--divider);border-radius:8px;font-size:13px;background:var(--surface);color:var(--on-surface)" />
+              <button type="button" class="pw-toggle" onclick="_togglePwVisibility('adminNewPassword',this)" tabindex="-1" aria-label="Show/hide password"><span class="material-icons">visibility</span></button>
+            </div>
+            <div class="password-strength compact" id="adminNewPasswordStrength" aria-live="polite">
+              <div class="password-strength-header">
+                <span>Strength: <strong data-role="label">Weak</strong></span>
+                <span data-role="score">0/5</span>
+              </div>
+              <div class="password-strength-meter"><span data-role="fill"></span></div>
+              <div class="password-strength-rules">
+                <span data-rule="length">10+ chars</span>
+                <span data-rule="upper">Uppercase</span>
+                <span data-rule="lower">Lowercase</span>
+                <span data-rule="number">Number</span>
+                <span data-rule="symbol">Symbol</span>
+              </div>
+            </div>
           </div>
           <div class="field" style="min-width:100px;gap:4px">
             <label style="font-size:11px;font-weight:600;color:var(--on-surface-medium);text-transform:uppercase;letter-spacing:0.5px">Role</label>
@@ -385,7 +466,10 @@
   <div class="profile-dialog" role="dialog" aria-modal="true" aria-labelledby="editUserTitle" style="width:min(560px,100%)">
     <div class="profile-dialog-header">
       <div style="display:flex;align-items:center;gap:12px">
-        <div class="profile-avatar"><span class="material-icons">edit</span></div>
+        <div class="profile-avatar">
+          <img id="editUserAvatarImg" class="profile-avatar-img" alt="User avatar" referrerpolicy="no-referrer" onerror="_setAvatarImage('editUserAvatarImg','editUserAvatarFallback',null)" />
+          <span class="material-icons" id="editUserAvatarFallback">person</span>
+        </div>
         <div>
           <h3 id="editUserTitle" style="font-size:18px;font-weight:500;letter-spacing:-0.1px">Edit user</h3>
           <div style="font-size:13px;color:var(--on-surface-medium)" id="editUserSubtitle"></div>
@@ -397,9 +481,38 @@
     </div>
 
     <div class="profile-section">
+      <div class="profile-section-title">Username</div>
+      <input type="text" id="editUserUsername" placeholder="e.g. Bob Smith" autocomplete="off"
+        style="padding:9px 12px;border:1px solid var(--divider);border-radius:10px;font-size:14px;background:var(--surface);color:var(--on-surface)" />
+    </div>
+
+    <div class="profile-section">
       <div class="profile-section-title">Email address</div>
       <input type="email" id="editUserEmail" placeholder="user@example.com" autocomplete="off"
         style="padding:9px 12px;border:1px solid var(--divider);border-radius:10px;font-size:14px;background:var(--surface);color:var(--on-surface)" />
+    </div>
+
+    <div class="profile-section">
+      <div class="profile-section-title">Set new password (optional)</div>
+      <div class="pw-field-wrap">
+        <input type="password" id="editUserNewPassword" placeholder="Leave blank to keep current password" autocomplete="new-password"
+          style="padding:9px 12px;border:1px solid var(--divider);border-radius:10px;font-size:14px;background:var(--surface);color:var(--on-surface)" />
+        <button type="button" class="pw-toggle" onclick="_togglePwVisibility('editUserNewPassword',this)" tabindex="-1" aria-label="Show/hide password"><span class="material-icons">visibility</span></button>
+      </div>
+      <div class="password-strength compact" id="editUserPasswordStrength" aria-live="polite">
+        <div class="password-strength-header">
+          <span>Strength: <strong data-role="label">Weak</strong></span>
+          <span data-role="score">0/5</span>
+        </div>
+        <div class="password-strength-meter"><span data-role="fill"></span></div>
+        <div class="password-strength-rules">
+          <span data-rule="length">10+ chars</span>
+          <span data-rule="upper">Uppercase</span>
+          <span data-rule="lower">Lowercase</span>
+          <span data-rule="number">Number</span>
+          <span data-rule="symbol">Symbol</span>
+        </div>
+      </div>
     </div>
 
     <div class="profile-section">
@@ -436,7 +549,10 @@
   <div class="profile-dialog" role="dialog" aria-modal="true" aria-labelledby="profileTitle">
     <div class="profile-dialog-header">
       <div style="display:flex;align-items:center;gap:12px">
-        <div class="profile-avatar"><span class="material-icons">person</span></div>
+        <div class="profile-avatar">
+          <img id="profileAvatarImg" class="profile-avatar-img" alt="Profile avatar" referrerpolicy="no-referrer" />
+          <span class="material-icons" id="profileAvatarFallback">person</span>
+        </div>
         <div>
           <h3 id="profileTitle" style="font-size:18px;font-weight:500;letter-spacing:-0.1px">Account settings</h3>
           <div style="font-size:13px;color:var(--on-surface-medium)" id="profileUsernameDisplay"></div>
@@ -447,12 +563,31 @@
       </button>
     </div>
 
+    <!-- Username -->
+    <div class="profile-section">
+      <div class="profile-section-title">Username</div>
+      <div class="field">
+        <label for="profileUsername">Username</label>
+        <input type="text" id="profileUsername" placeholder="Your username" autocomplete="username" />
+      </div>
+      <p class="profile-msg" id="profileUsernameMsg"></p>
+      <button class="btn btn-primary" style="width:100%;justify-content:center" onclick="saveProfileUsername()">Save username</button>
+    </div>
+
+    <div class="profile-divider"></div>
+
     <!-- Email -->
     <div class="profile-section">
       <div class="profile-section-title">Email address</div>
       <div class="field">
         <label for="profileEmail">Email</label>
         <input type="email" id="profileEmail" placeholder="your@email.com" autocomplete="email" />
+      </div>
+      <div class="profile-email-verify-row">
+        <span id="profileEmailVerifyStatus" class="profile-email-verify-status">Verification status unknown</span>
+        <button class="btn btn-text" id="profileResendVerificationBtn" style="padding:4px 0" onclick="resendProfileVerificationEmail()">
+          <span class="material-icons" style="font-size:16px">mark_email_unread</span> Send verification email
+        </button>
       </div>
       <p class="profile-msg" id="profileEmailMsg"></p>
       <button class="btn btn-primary" style="width:100%;justify-content:center" onclick="saveProfileEmail()">Save email</button>
@@ -464,16 +599,32 @@
     <div class="profile-section">
       <div class="profile-section-title">Change password</div>
       <div class="field">
-        <label for="profileCurrentPw">Current password</label>
-        <input type="password" id="profileCurrentPw" placeholder="Enter current password" autocomplete="current-password" />
-      </div>
-      <div class="field">
         <label for="profileNewPw">New password</label>
-        <input type="password" id="profileNewPw" placeholder="At least 6 characters" autocomplete="new-password" />
+        <div class="pw-field-wrap">
+          <input type="password" id="profileNewPw" placeholder="Use 10+ chars with mixed types" autocomplete="new-password" />
+          <button type="button" class="pw-toggle" onclick="_togglePwVisibility('profileNewPw',this)" tabindex="-1" aria-label="Show/hide password"><span class="material-icons">visibility</span></button>
+        </div>
+        <div class="password-strength" id="profileNewPasswordStrength" aria-live="polite">
+          <div class="password-strength-header">
+            <span>Strength: <strong data-role="label">Weak</strong></span>
+            <span data-role="score">0/5</span>
+          </div>
+          <div class="password-strength-meter"><span data-role="fill"></span></div>
+          <div class="password-strength-rules">
+            <span data-rule="length">10+ chars</span>
+            <span data-rule="upper">Uppercase</span>
+            <span data-rule="lower">Lowercase</span>
+            <span data-rule="number">Number</span>
+            <span data-rule="symbol">Symbol</span>
+          </div>
+        </div>
       </div>
       <div class="field">
         <label for="profileConfirmPw">Confirm new password</label>
-        <input type="password" id="profileConfirmPw" placeholder="Repeat new password" autocomplete="new-password" />
+        <div class="pw-field-wrap">
+          <input type="password" id="profileConfirmPw" placeholder="Repeat new password" autocomplete="new-password" />
+          <button type="button" class="pw-toggle" onclick="_togglePwVisibility('profileConfirmPw',this)" tabindex="-1" aria-label="Show/hide password"><span class="material-icons">visibility</span></button>
+        </div>
       </div>
       <p class="profile-msg" id="profilePwMsg"></p>
       <button class="btn btn-primary" style="width:100%;justify-content:center" onclick="saveProfilePassword()">Change password</button>
@@ -496,6 +647,19 @@
         Hide Add a WatchBot
       </label>
       <p style="font-size:12px;color:var(--on-surface-medium);margin:0">Hides the &ldquo;Add a WatchBot&rdquo; form from your dashboard.</p>
+    </div>
+
+    <div class="profile-divider"></div>
+
+    <!-- AI summaries -->
+    <div class="profile-section">
+      <div class="profile-section-title">AI summaries</div>
+      <label class="toggle-switch" style="font-size:14px;color:var(--on-surface)">
+        <input type="checkbox" id="profileDisableAiSummary" onchange="saveProfileDisableAiSummary(this.checked)">
+        <span class="toggle-track"></span>
+        Disable AI summaries
+      </label>
+      <p style="font-size:12px;color:var(--on-surface-medium);margin:0">Disable AI-generated change summaries for all your WatchBots. Changes are still detected and logged.</p>
     </div>
 
     <div class="profile-divider"></div>
@@ -559,7 +723,10 @@
       <p style="font-size:13px;color:var(--on-surface-medium);margin:0">Permanently delete your account and all your trackers. This cannot be undone.</p>
       <div class="field">
         <label for="profileDeletePw">Confirm with your password</label>
-        <input type="password" id="profileDeletePw" placeholder="Enter your password" autocomplete="current-password" />
+        <div class="pw-field-wrap">
+          <input type="password" id="profileDeletePw" placeholder="Enter your password" autocomplete="current-password" />
+          <button type="button" class="pw-toggle" onclick="_togglePwVisibility('profileDeletePw',this)" tabindex="-1" aria-label="Show/hide password"><span class="material-icons">visibility</span></button>
+        </div>
       </div>
       <p class="profile-msg" id="profileDeleteMsg"></p>
       <button class="btn" style="background:#fce8e6;color:var(--error);width:100%;justify-content:center;border:1px solid #f5c6c3" onclick="deleteAccount()">
@@ -619,19 +786,7 @@
     <div class="field" style="margin-bottom:14px">
       <label for="toIntervalSelect">Check every</label>
       <select id="toIntervalSelect">
-        <option value="10000">10 seconds</option>
-        <option value="30000" selected>30 seconds</option>
-        <option value="60000">1 minute</option>
-        <option value="300000">5 minutes</option>
-        <option value="600000">10 minutes</option>
-        <option value="1800000">30 minutes</option>
-        <option value="3600000">1 hour</option>
-        <option value="14400000">4 hours</option>
-        <option value="21600000">6 hours</option>
-        <option value="43200000">12 hours</option>
-        <option value="86400000">24 hours</option>
-        <option value="259200000">3 days</option>
-        <option value="604800000">7 days</option>
+        <!-- populated by _intervalOptionsHTML() in showApp() — always admin options -->
       </select>
     </div>
     <label class="ai-checkbox-row" style="margin-bottom:10px;font-size:14px">
