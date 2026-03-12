@@ -3779,6 +3779,9 @@ document.addEventListener('keydown', (e) => {
   if (document.getElementById('adminOverlay')?.classList.contains('show')) {
     closeAdminPanel(); return;
   }
+  if (document.getElementById('profilesOverlay')?.classList.contains('show')) {
+    closeProfiles(); return;
+  }
   if (document.getElementById('profileOverlay')?.classList.contains('show')) {
     closeProfile(); return;
   }

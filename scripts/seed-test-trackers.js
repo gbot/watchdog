@@ -21,6 +21,7 @@
 'use strict';
 
 const path     = require('path');
+const fs       = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const Database  = require('better-sqlite3');
 
@@ -151,14 +152,30 @@ function pick(arr) {
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 function main() {
   const DB_PATH = path.join(__dirname, '../data/watchbot.db');
+  // Ensure the data directory exists before opening the database
+  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+
   const db = new Database(DB_PATH);
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
 
   // Resolve the target user
-  const user = db.prepare('SELECT id, username FROM users WHERE LOWER(username) = LOWER(?)').get(userArg);
+  const user = db.prepare('SELECT id, username, activeProfileId FROM users WHERE LOWER(username) = LOWER(?)').get(userArg);
   if (!user) {
     console.error(`✗ User "${userArg}" not found. Create the user first or pass --user <username>.`);
+    db.close();
+    process.exit(1);
+  }
+
+  // Resolve the profile to assign trackers to (use activeProfileId, fall back to default profile)
+  let profileId = user.activeProfileId;
+  if (!profileId) {
+    const defaultProfile = db.prepare('SELECT id FROM profiles WHERE userId = ? AND isDefault = 1').get(user.id);
+    profileId = defaultProfile?.id || null;
+  }
+
+  if (!profileId) {
+    console.error(`✗ No profile found for user "${user.username}". Run the server once to auto-create one, or run seed-test-users.js first.`);
     db.close();
     process.exit(1);
   }
@@ -178,11 +195,13 @@ function main() {
     INSERT INTO trackers
       (id, userId, label, url, interval, active, status,
        lastCheck, lastHash, lastBody, httpStatus, changeCount,
-       changeSummary, changeSnippet, error, aiSummary, createdAt, position)
+       changeSummary, changeSnippet, error, aiSummary, createdAt, position,
+       emailNotify, faviconUrl, profileId)
     VALUES
       (?, ?, ?, ?, ?, 1, 'pending',
        NULL, NULL, NULL, NULL, 0,
-       NULL, NULL, NULL, 0, ?, ?)
+       NULL, NULL, NULL, 0, ?, ?,
+       0, NULL, ?)
   `);
 
   let created = 0;
@@ -201,7 +220,8 @@ function main() {
         url,
         pick(INTERVALS),
         new Date().toISOString(),
-        nextPos++
+        nextPos++,
+        profileId
       );
       created++;
     }
@@ -210,6 +230,7 @@ function main() {
   insertMany();
 
   console.log(`\n✓ Trackers seeded for user "${user.username}"`);
+  console.log(`  Profile : ${profileId}`);
   console.log(`  Created : ${created}`);
   console.log(`  Skipped : ${skipped} (URL already tracked by this user)`);
   console.log(`  AI summary: OFF`);

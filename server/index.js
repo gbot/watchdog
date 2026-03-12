@@ -1972,10 +1972,7 @@ app.delete('/api/admin/trackers/:id', adminMiddleware, (req, res) => {
     db.prepare('DELETE FROM trackers WHERE id = ?').run(tracker.id);
   })();
   trackers = trackers.filter(t => t.id !== tracker.id);
-  const userTrackers = trackers
-    .filter(t => t.userId === targetUserId)
-    .map(({ lastBody, ...rest }) => rest);
-  broadcastToUser({ type: 'update', trackers: userTrackers }, targetUserId);
+  broadcastToUser({ type: 'update', trackers: getActiveProfileTrackers(targetUserId) }, targetUserId);
   res.json({ success: true });
 });
 
