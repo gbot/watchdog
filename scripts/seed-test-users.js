@@ -17,11 +17,15 @@
 'use strict';
 
 const path    = require('path');
+const fs      = require('fs');
 const bcrypt  = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
 const Database = require('better-sqlite3');
 
 const DB_PATH = path.join(__dirname, '../data/watchbot.db');
+// Ensure the data directory exists before opening the database
+fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
@@ -32,9 +36,14 @@ const USER_COUNT = 50;
 async function main() {
   const hash = await bcrypt.hash(PASSWORD, 10); // cost 10 — fast enough for a seed script
 
-  const insert = db.prepare(`
-    INSERT OR IGNORE INTO users (id, username, email, passwordHash, createdAt, role)
-    VALUES (?, ?, ?, ?, ?, 'user')
+  const insertUser = db.prepare(`
+    INSERT OR IGNORE INTO users (id, username, email, passwordHash, createdAt, role, activeProfileId)
+    VALUES (?, ?, ?, ?, ?, 'user', ?)
+  `);
+
+  const insertProfile = db.prepare(`
+    INSERT OR IGNORE INTO profiles (id, userId, name, isDefault, createdAt)
+    VALUES (?, ?, 'Default', 1, ?)
   `);
 
   let created = 0;
@@ -42,12 +51,19 @@ async function main() {
 
   const insertMany = db.transaction(() => {
     for (let i = 1; i <= USER_COUNT; i++) {
-      const n        = String(i).padStart(2, '0');
-      const username = `testuser_${n}`;
-      const email    = `testuser_${n}@example.com`;
-      const result   = insert.run(uuidv4(), username, email, hash, new Date().toISOString());
-      if (result.changes > 0) created++;
-      else skipped++;
+      const n         = String(i).padStart(2, '0');
+      const username  = `testuser_${n}`;
+      const email     = `testuser_${n}@example.com`;
+      const userId    = uuidv4();
+      const profileId = uuidv4();
+      const now       = new Date().toISOString();
+      const result    = insertUser.run(userId, username, email, hash, now, profileId);
+      if (result.changes > 0) {
+        insertProfile.run(profileId, userId, now);
+        created++;
+      } else {
+        skipped++;
+      }
     }
   });
 

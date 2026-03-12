@@ -9,6 +9,11 @@ let _authResetToken   = '';
 let siteSettings      = { allowRegistration: true, maintenanceMode: false, userIntervalOptions: [] };
 let _sseProbePending  = false;
 
+// Profiles state
+let profiles       = [];   // [{id, userId, name, isDefault, createdAt}]
+let activeProfileId = null; // currently active profile id
+let userTotalTrackerCount = 0; // total trackers across ALL profiles (updated from SSE)
+
 // ─── TOOLTIP ENGINE ──────────────────────────────────────────────────────────
 // Single floating element driven by event delegation — works for all elements
 // including those added dynamically after page load. Elements should use
@@ -578,6 +583,11 @@ function showApp() {
   if (currentUser.notificationsEnabled && Notification.permission === 'default') {
     Notification.requestPermission();
   }
+  // Initialise profiles state from the login/me response
+  if (currentUser.activeProfileId) {
+    activeProfileId = currentUser.activeProfileId;
+  }
+  loadProfiles().then(() => _updateTopbarProfileName());
   // Apply panel visibility prefs from the user object (populated by /api/auth/me)
   applyPanelPrefs(currentUser);
   // Restore cached AI finder results if any
@@ -697,6 +707,10 @@ async function handleLogout() {
   if (evtSource) { evtSource.close(); evtSource = null; }
   currentUser = null;
   trackers    = [];
+  profiles    = [];
+  activeProfileId = null;
+  userTotalTrackerCount = 0;
+  _updateTopbarProfileName();
   renderTrackers();
   updateBadge();
   document.getElementById('userArea').style.display = 'none';
@@ -1324,6 +1338,7 @@ async function adminImpersonate(id) {
   closeAdminPanel();
   if (evtSource) { evtSource.close(); evtSource = null; }
   trackers = [];
+  userTotalTrackerCount = 0;
   renderTrackers();
   showApp();
 }
@@ -1335,6 +1350,7 @@ async function stopImpersonating() {
   currentUser = data;
   if (evtSource) { evtSource.close(); evtSource = null; }
   trackers = [];
+  userTotalTrackerCount = 0;
   renderTrackers();
   showApp();
 }
@@ -1583,6 +1599,160 @@ function closeProfile() {
   document.body.classList.remove('modal-open');
 }
 
+// ─── PROFILES ────────────────────────────────────────────────────────────────
+
+async function loadProfiles() {
+  try {
+    const res = await fetch('/api/profiles');
+    if (!res.ok) return;
+    profiles = await res.json();
+  } catch {}
+}
+
+function _updateTopbarProfileName() {
+  const nameEl = document.getElementById('topbarProfileName');
+  if (!nameEl) return;
+  const active = profiles.find(p => p.id === activeProfileId);
+  if (active && !active.isDefault) {
+    nameEl.textContent = active.name;
+    nameEl.style.display = '';
+  } else {
+    nameEl.textContent = '';
+    nameEl.style.display = 'none';
+  }
+}
+
+async function openProfiles() {
+  await loadProfiles();
+  renderProfilesDialog();
+  const overlay = document.getElementById('profilesOverlay');
+  overlay.classList.add('show');
+  overlay.setAttribute('aria-hidden', 'false');
+  document.body.classList.add('modal-open');
+  setTimeout(() => document.getElementById('newProfileName')?.focus(), 100);
+}
+
+function closeProfiles() {
+  const overlay = document.getElementById('profilesOverlay');
+  overlay.classList.remove('show');
+  overlay.setAttribute('aria-hidden', 'true');
+  document.body.classList.remove('modal-open');
+}
+
+function renderProfilesDialog() {
+  const list = document.getElementById('profilesList');
+  const countNote = document.getElementById('profilesCountNote');
+  const createSection = document.getElementById('profilesCreateSection');
+  if (!list) return;
+
+  list.innerHTML = profiles.map(p => {
+    const isActive = p.id === activeProfileId;
+    const trackerCount = p.trackerCount ?? 0;
+    return `
+      <div class="profile-item${isActive ? ' profile-item-active' : ''}" data-profile-id="${escHtml(p.id)}">
+        <div class="profile-item-info">
+          <span class="material-icons profile-item-icon">${p.isDefault ? 'home' : 'layers'}</span>
+          <div>
+            <div class="profile-item-name" id="profile-name-display-${escHtml(p.id)}">${escHtml(p.name)}</div>
+            <div class="profile-item-meta">${trackerCount} WatchBot${trackerCount !== 1 ? 's' : ''}${isActive ? ' · <strong>Active</strong>' : ''}</div>
+          </div>
+        </div>
+        <div class="profile-item-actions">
+          ${!isActive ? `<button class="btn btn-primary" style="padding:5px 12px;font-size:13px" onclick="switchProfile('${escHtml(p.id)}')">Switch</button>` : `<span class="profile-active-badge">Active</span>`}
+          ${!p.isDefault ? `<button class="btn btn-text" style="font-size:13px;padding:5px 8px" onclick="renameProfilePrompt('${escHtml(p.id)}')" data-tip="Rename profile"><span class="material-icons" style="font-size:16px">edit</span></button>` : ''}
+          ${!p.isDefault ? `<button class="btn btn-text" style="font-size:13px;padding:5px 8px;color:var(--error)" onclick="deleteProfileConfirm('${escHtml(p.id)}')" data-tip="Delete profile"><span class="material-icons" style="font-size:16px">delete</span></button>` : ''}
+        </div>
+      </div>`;
+  }).join('');
+
+  const count = profiles.length;
+  const maxProfiles = 10;
+  if (countNote) countNote.textContent = `${count} / ${maxProfiles} profiles used`;
+  if (createSection) createSection.style.display = count >= maxProfiles ? 'none' : '';
+}
+
+async function switchProfile(profileId) {
+  const msgEl = document.getElementById('profilesCreateMsg');
+  try {
+    const res = await fetch(`/api/profiles/${profileId}/switch`, { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) { if (msgEl) { msgEl.textContent = data.error || 'Failed to switch profile'; msgEl.className = 'profile-msg error'; } return; }
+    // The server broadcasts a profile-switch SSE event which will update trackers.
+    // Update activeProfileId locally immediately for a snappy UI.
+    activeProfileId = data.activeProfileId;
+    if (currentUser) currentUser.activeProfileId = activeProfileId;
+    _updateTopbarProfileName();
+    renderProfilesDialog();
+  } catch { if (msgEl) { msgEl.textContent = 'Connection error'; msgEl.className = 'profile-msg error'; } }
+}
+
+async function createProfile() {
+  const nameInput = document.getElementById('newProfileName');
+  const msgEl = document.getElementById('profilesCreateMsg');
+  const name = nameInput?.value?.trim();
+  if (msgEl) { msgEl.textContent = ''; msgEl.className = 'profile-msg'; }
+  if (!name) { if (msgEl) { msgEl.textContent = 'Please enter a profile name.'; msgEl.className = 'profile-msg error'; } return; }
+  try {
+    const res = await fetch('/api/profiles', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    const data = await res.json();
+    if (!res.ok) { if (msgEl) { msgEl.textContent = data.error || 'Failed to create profile'; msgEl.className = 'profile-msg error'; } return; }
+    if (nameInput) nameInput.value = '';
+    profiles.push(data);
+    renderProfilesDialog();
+    showSnackbar(`Profile "${escHtml(data.name)}" created`);
+  } catch { if (msgEl) { msgEl.textContent = 'Connection error'; msgEl.className = 'profile-msg error'; } }
+}
+
+async function renameProfilePrompt(profileId) {
+  const profile = profiles.find(p => p.id === profileId);
+  if (!profile) return;
+  const newName = prompt(`Rename profile "${profile.name}":`, profile.name);
+  if (newName === null) return; // cancelled
+  const trimmed = newName.trim();
+  if (!trimmed) return;
+  try {
+    const res = await fetch(`/api/profiles/${profileId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: trimmed }),
+    });
+    const data = await res.json();
+    if (!res.ok) { showSnackbar(data.error || 'Failed to rename profile'); return; }
+    const idx = profiles.findIndex(p => p.id === profileId);
+    if (idx !== -1) profiles[idx] = { ...profiles[idx], name: trimmed };
+    _updateTopbarProfileName();
+    renderProfilesDialog();
+    showSnackbar(`Profile renamed to "${escHtml(trimmed)}"`);
+  } catch { showSnackbar('Connection error'); }
+}
+
+async function deleteProfileConfirm(profileId) {
+  const profile = profiles.find(p => p.id === profileId);
+  if (!profile) return;
+  const trackerCount = profile.trackerCount ?? 0;
+  const moveSuffix = trackerCount > 0
+    ? ` — ${trackerCount} WatchBot${trackerCount !== 1 ? 's' : ''} will be moved to Default`
+    : '';
+  const confirmed = await openDeleteConfirmDialog(
+    `profile "${profile.name}"${moveSuffix}`,
+    'Delete profile?'
+  );
+  if (!confirmed) return;
+  try {
+    const res = await fetch(`/api/profiles/${profileId}`, { method: 'DELETE' });
+    const data = await res.json();
+    if (!res.ok) { showSnackbar(data.error || 'Failed to delete profile'); return; }
+    profiles = profiles.filter(p => p.id !== profileId);
+    // activeProfileId is updated by the profile-switch SSE event from the server
+    renderProfilesDialog();
+    showSnackbar(`Profile "${escHtml(profile.name)}" deleted`);
+  } catch { showSnackbar('Connection error'); }
+}
+
 async function saveProfileUsername() {
   const username = document.getElementById('profileUsername').value.trim();
   const msgEl = document.getElementById('profileUsernameMsg');
@@ -1736,7 +1906,8 @@ async function saveProfilePassword() {
 
 function sendTestNotification() {
   if (Notification.permission === 'granted') {
-    showBrowserNotification('Watchbot: Notifications working!', 'Browser notifications are enabled and working correctly.', '/');
+    const name = String(currentUser?.username || 'there').replace(/[^\w\s\-'.]/g, '').slice(0, 50) || 'there';
+    showBrowserNotification('Watchbot: Notifications working!', `Hi ${name}! Browser notifications from Watchbot are working.`, '/');
   } else if (Notification.permission === 'denied') {
     showSnackbar('Notifications are blocked in your browser settings.', 'error');
   } else {
@@ -1849,6 +2020,7 @@ async function deleteAccount() {
       if (evtSource) { evtSource.close(); evtSource = null; }
       currentUser = null;
       trackers    = [];
+      userTotalTrackerCount = 0;
       renderTrackers();
       updateBadge();
       document.getElementById('userArea').style.display = 'none';
@@ -1870,10 +2042,30 @@ function connectSSE() {
       if (evtSource) { evtSource.close(); evtSource = null; }
       currentUser = null;
       trackers    = [];
+      userTotalTrackerCount = 0;
       renderTrackers();
       updateBadge();
       document.getElementById('userArea').style.display = 'none';
       showAuthOverlay('login');
+      return;
+    }
+    if (data.type === 'profile-switch') {
+      // Full replace with the new profile's trackers; update active profile state
+      if (data.activeProfileId) {
+        activeProfileId = data.activeProfileId;
+        if (currentUser) currentUser.activeProfileId = activeProfileId;
+      }
+      trackers = data.trackers || [];
+      if (data.totalTrackerCount !== undefined) userTotalTrackerCount = data.totalTrackerCount;
+      // Clear per-tracker history cache so switching profiles shows fresh data
+      Object.keys(_tcCache).forEach(k => delete _tcCache[k]);
+      renderTrackers();
+      updateBadge();
+      _updateTopbarProfileName();
+      // Re-render profiles dialog if it's open
+      if (document.getElementById('profilesOverlay')?.classList.contains('show')) {
+        renderProfilesDialog();
+      }
       return;
     }
     if (data.type === 'init' || data.type === 'update') {
@@ -1882,6 +2074,7 @@ function connectSSE() {
       if (data.type === 'init') {
         // Full replace on initial load
         trackers = data.trackers;
+        if (data.totalTrackerCount !== undefined) userTotalTrackerCount = data.totalTrackerCount;
       } else {
         // Merge update by id, preserving client's current order
         const incoming = new Map(data.trackers.map(t => [t.id, t]));
@@ -1891,6 +2084,7 @@ function connectSSE() {
         // Prepend any newly added trackers (server always unshifts new ones to front)
         const existingIds = new Set(trackers.map(t => t.id));
         data.trackers.forEach(t => { if (!existingIds.has(t.id)) trackers.unshift(t); });
+        if (data.totalTrackerCount !== undefined) userTotalTrackerCount = data.totalTrackerCount;
       }
       if (data.type === 'update') {
         // Invalidate cache when history grows, regardless of tracker status.
@@ -1915,6 +2109,10 @@ function connectSSE() {
             triggerBrowserNotification(t.label, t.url);
           }
         });
+        // Keep the Profiles modal tracker-count up to date if it is open
+        if (document.getElementById('profilesOverlay')?.classList.contains('show')) {
+          loadProfiles().then(() => renderProfilesDialog());
+        }
       }
     }
   };
@@ -1927,6 +2125,7 @@ function connectSSE() {
       if (probe.status === 503) {
         currentUser = null;
         trackers    = [];
+        userTotalTrackerCount = 0;
         renderTrackers();
         updateBadge();
         showMaintenanceOverlay();
@@ -3090,10 +3289,9 @@ function trackerHTML(t) {
 }
 
 function updateBadge() {
-  const active = trackers.filter(t => t.active).length;
   const limit = currentUser && currentUser.trackerLimit ? currentUser.trackerLimit : null;
   const limitStr = limit ? limit : '<span style="font-size:22px;line-height:1;vertical-align:middle">∞</span>';
-  document.getElementById('activeCount').innerHTML = `${active} active / ${limitStr}`;
+  document.getElementById('activeCount').innerHTML = `${userTotalTrackerCount} / ${limitStr}`;
   const btn = document.getElementById('dismissAllBtn');
   if (btn) btn.style.display = trackers.some(t => t.status === 'changed') ? '' : 'none';
   const hasHistory = trackers.some(t => t.changeCount > 0);
@@ -3594,6 +3792,9 @@ document.addEventListener('keydown', (e) => {
   }
   if (document.getElementById('adminOverlay')?.classList.contains('show')) {
     closeAdminPanel(); return;
+  }
+  if (document.getElementById('profilesOverlay')?.classList.contains('show')) {
+    closeProfiles(); return;
   }
   if (document.getElementById('profileOverlay')?.classList.contains('show')) {
     closeProfile(); return;
