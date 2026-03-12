@@ -803,6 +803,10 @@
     opacity: 1;
     pointer-events: auto;
   }
+  /* Raised above the maintenance overlay so admins can log in during maintenance */
+  .auth-overlay.maintenance-admin-login {
+    z-index: 700;
+  }
   .auth-dialog {
     width: min(400px, 100%);
     background: var(--surface);

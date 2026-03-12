@@ -1402,8 +1402,12 @@ app.post('/api/auth/login', async (req, res) => {
 
   if (user.disabled) return res.status(403).json({ error: 'Your account has been deactivated. Please contact an administrator.' });
 
+  if (getSetting('maintenanceMode', '0') === '1' && (user.role || 'user') !== 'admin')
+    return res.status(503).json({ error: 'The site is currently under maintenance.' });
+
   const token = jwt.sign({ userId: user.id, username: user.username, role: user.role || 'user' }, JWT_SECRET, { expiresIn: '7d' });
   res.cookie('watchbot_auth', token, { httpOnly: true, sameSite: 'lax', maxAge: COOKIE_MAX_AGE });
+  res.clearCookie('watchbot_restore'); // clear any stale impersonation session
   res.json({
     id: user.id,
     username: user.username,

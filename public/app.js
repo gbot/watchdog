@@ -280,6 +280,21 @@ async function init() {
 }
 
 let _maintPollTimer = null;
+let _maintAdminClickCount = 0;
+let _maintAdminClickTimer = null;
+
+function _maintAdminClickHandler() {
+  _maintAdminClickCount++;
+  if (_maintAdminClickTimer) clearTimeout(_maintAdminClickTimer);
+  if (_maintAdminClickCount >= 5) {
+    _maintAdminClickCount = 0;
+    // Raise auth overlay above the maintenance overlay and show login form
+    document.getElementById('authOverlay').classList.add('maintenance-admin-login');
+    showAuthOverlay('login');
+  } else {
+    _maintAdminClickTimer = setTimeout(() => { _maintAdminClickCount = 0; }, 5000);
+  }
+}
 
 function showMaintenanceOverlay() {
   // Close any SSE connection first
@@ -292,6 +307,12 @@ function showMaintenanceOverlay() {
   overlay.classList.add('show');
   overlay.setAttribute('aria-hidden', 'false');
   document.body.classList.add('modal-open', 'maintenance-active');
+
+  // Secret admin login: clicking the maintenance title 5 times reveals the login form
+  _maintAdminClickCount = 0;
+  const titleEl = document.getElementById('maintTitle');
+  titleEl.removeEventListener('click', _maintAdminClickHandler);
+  titleEl.addEventListener('click', _maintAdminClickHandler);
 
   // Poll every 20 seconds — auto-dismiss when maintenance ends
   clearInterval(_maintPollTimer);
@@ -317,10 +338,15 @@ function showMaintenanceOverlay() {
 function hideMaintenanceOverlay() {
   clearInterval(_maintPollTimer);
   _maintPollTimer = null;
+  _maintAdminClickCount = 0;
+  if (_maintAdminClickTimer) { clearTimeout(_maintAdminClickTimer); _maintAdminClickTimer = null; }
+  const titleEl = document.getElementById('maintTitle');
+  if (titleEl) titleEl.removeEventListener('click', _maintAdminClickHandler);
   const overlay = document.getElementById('maintenanceOverlay');
   overlay.classList.remove('show');
   overlay.setAttribute('aria-hidden', 'true');
   document.body.classList.remove('modal-open', 'maintenance-active');
+  document.getElementById('authOverlay').classList.remove('maintenance-admin-login');
 }
 
 // ─── AUTH UI ──────────────────────────────────────────────────────────────────
@@ -658,6 +684,10 @@ async function handleLogin(e) {
     const data = await res.json();
     if (!res.ok) { errorEl.textContent = data.error || 'Login failed'; return; }
     currentUser = data;
+    // If the maintenance overlay was open (admin secret login), dismiss it
+    if (document.getElementById('maintenanceOverlay').classList.contains('show')) {
+      hideMaintenanceOverlay();
+    }
     showApp();
     if (currentUser.emailVerified === false) {
       showSnackbar('Your email is not verified yet. Use Account settings to send a verification email.');
