@@ -398,10 +398,11 @@ function saveTrackers(list) {
   // SSE broadcast per-user, strip lastBody — only send trackers for the user's active profile
   const affectedUserIds = new Set(list.map(t => t.userId).filter(Boolean));
   affectedUserIds.forEach(userId => {
-    broadcastToUser({ type: 'update', trackers: getActiveProfileTrackers(userId), totalTrackerCount: list.filter(t => t.userId === userId).length }, userId);
+    const userList = list.filter(t => t.userId === userId);
+    broadcastToUser({ type: 'update', trackers: getActiveProfileTrackers(userId), totalTrackerCount: userList.length, totalActiveTrackerCount: userList.filter(t => t.active).length }, userId);
   });
   // Notify users who lost all their trackers (clears stale tracker lists in other tabs)
-  emptyUserIds.forEach(uid => broadcastToUser({ type: 'update', trackers: getActiveProfileTrackers(uid), totalTrackerCount: 0 }, uid));
+  emptyUserIds.forEach(uid => broadcastToUser({ type: 'update', trackers: getActiveProfileTrackers(uid), totalTrackerCount: 0, totalActiveTrackerCount: 0 }, uid));
 }
 
 // Lightweight single-tracker save used during check cycles.
@@ -419,7 +420,7 @@ function _saveOneTracker(tracker) {
   });
   // Only broadcast trackers belonging to the user's currently active profile
   broadcastToUser(
-    { type: 'update', trackers: getActiveProfileTrackers(tracker.userId), totalTrackerCount: trackers.filter(t => t.userId === tracker.userId).length },
+    { type: 'update', trackers: getActiveProfileTrackers(tracker.userId), totalTrackerCount: trackers.filter(t => t.userId === tracker.userId).length, totalActiveTrackerCount: trackers.filter(t => t.userId === tracker.userId && t.active).length },
     tracker.userId
   );
 }
@@ -1211,7 +1212,8 @@ app.get('/api/events', authMiddleware, (req, res) => {
   log('⇄', _c.cyan, `SSE connected    ${req.username}  (${clientId.slice(0, 8)})`);
 
   const userTrackers = getActiveProfileTrackers(req.userId);
-  res.write(`data: ${JSON.stringify({ type: 'init', trackers: userTrackers, totalTrackerCount: trackers.filter(t => t.userId === req.userId).length })}\n\n`);
+  const userAllTrackers = trackers.filter(t => t.userId === req.userId);
+  res.write(`data: ${JSON.stringify({ type: 'init', trackers: userTrackers, totalTrackerCount: userAllTrackers.length, totalActiveTrackerCount: userAllTrackers.filter(t => t.active).length })}\n\n`);
 
   req.on('close', () => {
     sseClients.delete(clientId);
@@ -1767,7 +1769,8 @@ app.delete('/api/profiles/:id', authMiddleware, (req, res) => {
 
   // Broadcast updated tracker list (uses new activeProfileId from DB)
   const profileTrackers = getActiveProfileTrackers(req.userId);
-  broadcastToUser({ type: 'profile-switch', trackers: profileTrackers, activeProfileId: fallbackId, totalTrackerCount: trackers.filter(t => t.userId === req.userId).length }, req.userId);
+  const allUserTrackers = trackers.filter(t => t.userId === req.userId);
+  broadcastToUser({ type: 'profile-switch', trackers: profileTrackers, activeProfileId: fallbackId, totalTrackerCount: allUserTrackers.length, totalActiveTrackerCount: allUserTrackers.filter(t => t.active).length }, req.userId);
 
   res.json({ success: true, activeProfileId: fallbackId });
 });
@@ -1782,7 +1785,8 @@ app.post('/api/profiles/:id/switch', authMiddleware, (req, res) => {
   const profileTrackers = trackers
     .filter(t => t.userId === req.userId && t.profileId === profile.id)
     .map(({ lastBody, ...rest }) => rest);
-  broadcastToUser({ type: 'profile-switch', trackers: profileTrackers, activeProfileId: profile.id, totalTrackerCount: trackers.filter(t => t.userId === req.userId).length }, req.userId);
+  const allUserTrackers = trackers.filter(t => t.userId === req.userId);
+  broadcastToUser({ type: 'profile-switch', trackers: profileTrackers, activeProfileId: profile.id, totalTrackerCount: allUserTrackers.length, totalActiveTrackerCount: allUserTrackers.filter(t => t.active).length }, req.userId);
 
   res.json({ success: true, activeProfileId: profile.id });
 });
@@ -2053,7 +2057,8 @@ app.delete('/api/admin/trackers/:id', adminMiddleware, (req, res) => {
     db.prepare('DELETE FROM trackers WHERE id = ?').run(tracker.id);
   })();
   trackers = trackers.filter(t => t.id !== tracker.id);
-  broadcastToUser({ type: 'update', trackers: getActiveProfileTrackers(targetUserId), totalTrackerCount: trackers.filter(t => t.userId === targetUserId).length }, targetUserId);
+  const remainingUserTrackers = trackers.filter(t => t.userId === targetUserId);
+  broadcastToUser({ type: 'update', trackers: getActiveProfileTrackers(targetUserId), totalTrackerCount: remainingUserTrackers.length, totalActiveTrackerCount: remainingUserTrackers.filter(t => t.active).length }, targetUserId);
   res.json({ success: true });
 });
 

@@ -12,7 +12,8 @@ let _sseProbePending  = false;
 // Profiles state
 let profiles       = [];   // [{id, userId, name, isDefault, createdAt}]
 let activeProfileId = null; // currently active profile id
-let userTotalTrackerCount = 0; // total trackers across ALL profiles (updated from SSE)
+let userTotalTrackerCount = 0;       // total trackers across ALL profiles (updated from SSE)
+let userTotalActiveTrackerCount = 0; // active trackers across ALL profiles (updated from SSE)
 
 // ─── TOOLTIP ENGINE ──────────────────────────────────────────────────────────
 // Single floating element driven by event delegation — works for all elements
@@ -2163,6 +2164,7 @@ function connectSSE() {
       currentUser = null;
       trackers    = [];
       userTotalTrackerCount = 0;
+      userTotalActiveTrackerCount = 0;
       renderTrackers();
       updateBadge();
       document.getElementById('userArea').style.display = 'none';
@@ -2176,6 +2178,7 @@ function connectSSE() {
         currentUser = null;
         trackers    = [];
         userTotalTrackerCount = 0;
+        userTotalActiveTrackerCount = 0;
         renderTrackers();
         updateBadge();
         showMaintenanceOverlay();
@@ -2190,6 +2193,7 @@ function connectSSE() {
       }
       trackers = data.trackers || [];
       if (data.totalTrackerCount !== undefined) userTotalTrackerCount = data.totalTrackerCount;
+      if (data.totalActiveTrackerCount !== undefined) userTotalActiveTrackerCount = data.totalActiveTrackerCount;
       // Clear per-tracker history cache so switching profiles shows fresh data
       Object.keys(_tcCache).forEach(k => delete _tcCache[k]);
       renderTrackers();
@@ -2208,6 +2212,7 @@ function connectSSE() {
         // Full replace on initial load
         trackers = data.trackers;
         if (data.totalTrackerCount !== undefined) userTotalTrackerCount = data.totalTrackerCount;
+        if (data.totalActiveTrackerCount !== undefined) userTotalActiveTrackerCount = data.totalActiveTrackerCount;
       } else {
         // Merge update by id, preserving client's current order
         const incoming = new Map(data.trackers.map(t => [t.id, t]));
@@ -2218,6 +2223,7 @@ function connectSSE() {
         const existingIds = new Set(trackers.map(t => t.id));
         data.trackers.forEach(t => { if (!existingIds.has(t.id)) trackers.unshift(t); });
         if (data.totalTrackerCount !== undefined) userTotalTrackerCount = data.totalTrackerCount;
+        if (data.totalActiveTrackerCount !== undefined) userTotalActiveTrackerCount = data.totalActiveTrackerCount;
       }
       if (data.type === 'update') {
         // Invalidate cache when history grows, regardless of tracker status.
@@ -3423,8 +3429,27 @@ function trackerHTML(t) {
 
 function updateBadge() {
   const limit = currentUser && currentUser.trackerLimit ? currentUser.trackerLimit : null;
-  const limitStr = limit ? limit : '<span style="font-size:22px;line-height:1;vertical-align:middle">∞</span>';
-  document.getElementById('activeCount').innerHTML = `${userTotalTrackerCount} / ${limitStr}`;
+  const limitNum = limit != null ? limit : '∞';
+  const active = userTotalActiveTrackerCount;
+  const total  = userTotalTrackerCount;
+  const paused = total - active;
+
+  const el = document.getElementById('activeCount');
+  el.innerHTML =
+    '<span class="tbc-seg-active">' +
+      '<span class="material-icons" style="font-size:13px;line-height:1;opacity:0.9">play_circle</span>' +
+      active +
+    '</span>' +
+    '<span class="tbc-seg-total">' + total + ' / ' + limitNum + '</span>';
+
+  const tipParts = [
+    active + ' active WatchBot' + (active === 1 ? '' : 's'),
+    paused > 0 ? paused + ' paused' : null,
+    total + ' total across all profiles',
+    limit != null ? 'Limit: ' + limit : 'No tracker limit',
+  ].filter(Boolean).join('  ·  ');
+  el.setAttribute('data-tip', tipParts);
+
   const btn = document.getElementById('dismissAllBtn');
   if (btn) btn.style.display = trackers.some(t => t.status === 'changed') ? '' : 'none';
   const hasHistory = trackers.some(t => t.changeCount > 0);
