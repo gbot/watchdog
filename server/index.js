@@ -1680,6 +1680,7 @@ app.post('/api/auth/test-email', authMiddleware, async (req, res) => {
 
 // ─── PROFILES ROUTES ─────────────────────────────────────────────────────────
 const MAX_PROFILES = 10;
+const MAX_PROFILE_NAME_LENGTH = 50;
 
 app.get('/api/profiles', authMiddleware, (req, res) => {
   const profiles = db.prepare(
@@ -1691,7 +1692,7 @@ app.get('/api/profiles', authMiddleware, (req, res) => {
 app.post('/api/profiles', authMiddleware, (req, res) => {
   const name = String(req.body?.name || '').trim();
   if (!name) return res.status(400).json({ error: 'Profile name is required' });
-  if (name.length > 50) return res.status(400).json({ error: 'Profile name must be 50 characters or fewer' });
+  if (name.length > MAX_PROFILE_NAME_LENGTH) return res.status(400).json({ error: `Profile name must be ${MAX_PROFILE_NAME_LENGTH} characters or fewer` });
   const count = db.prepare('SELECT COUNT(*) as c FROM profiles WHERE userId = ?').get(req.userId).c;
   if (count >= MAX_PROFILES)
     return res.status(400).json({ error: `Maximum ${MAX_PROFILES} profiles allowed` });
@@ -1713,7 +1714,7 @@ app.patch('/api/profiles/:id', authMiddleware, (req, res) => {
   if (profile.isDefault === 1) return res.status(400).json({ error: 'Cannot rename the default profile' });
   const name = String(req.body?.name || '').trim();
   if (!name) return res.status(400).json({ error: 'Profile name is required' });
-  if (name.length > 50) return res.status(400).json({ error: 'Profile name must be 50 characters or fewer' });
+  if (name.length > MAX_PROFILE_NAME_LENGTH) return res.status(400).json({ error: `Profile name must be ${MAX_PROFILE_NAME_LENGTH} characters or fewer` });
   db.prepare('UPDATE profiles SET name = ? WHERE id = ?').run(name, profile.id);
   res.json({ ...profile, name, isDefault: false });
 });
