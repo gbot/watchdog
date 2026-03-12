@@ -398,10 +398,11 @@ function saveTrackers(list) {
   // SSE broadcast per-user, strip lastBody — only send trackers for the user's active profile
   const affectedUserIds = new Set(list.map(t => t.userId).filter(Boolean));
   affectedUserIds.forEach(userId => {
-    broadcastToUser({ type: 'update', trackers: getActiveProfileTrackers(userId), totalTrackerCount: list.filter(t => t.userId === userId).length }, userId);
+    const userList = list.filter(t => t.userId === userId);
+    broadcastToUser({ type: 'update', trackers: getActiveProfileTrackers(userId), totalTrackerCount: userList.length, totalActiveTrackerCount: userList.filter(t => t.active).length }, userId);
   });
   // Notify users who lost all their trackers (clears stale tracker lists in other tabs)
-  emptyUserIds.forEach(uid => broadcastToUser({ type: 'update', trackers: getActiveProfileTrackers(uid), totalTrackerCount: 0 }, uid));
+  emptyUserIds.forEach(uid => broadcastToUser({ type: 'update', trackers: getActiveProfileTrackers(uid), totalTrackerCount: 0, totalActiveTrackerCount: 0 }, uid));
 }
 
 // Lightweight single-tracker save used during check cycles.
@@ -419,7 +420,7 @@ function _saveOneTracker(tracker) {
   });
   // Only broadcast trackers belonging to the user's currently active profile
   broadcastToUser(
-    { type: 'update', trackers: getActiveProfileTrackers(tracker.userId), totalTrackerCount: trackers.filter(t => t.userId === tracker.userId).length },
+    { type: 'update', trackers: getActiveProfileTrackers(tracker.userId), totalTrackerCount: trackers.filter(t => t.userId === tracker.userId).length, totalActiveTrackerCount: trackers.filter(t => t.userId === tracker.userId && t.active).length },
     tracker.userId
   );
 }
@@ -1211,7 +1212,8 @@ app.get('/api/events', authMiddleware, (req, res) => {
   log('⇄', _c.cyan, `SSE connected    ${req.username}  (${clientId.slice(0, 8)})`);
 
   const userTrackers = getActiveProfileTrackers(req.userId);
-  res.write(`data: ${JSON.stringify({ type: 'init', trackers: userTrackers, totalTrackerCount: trackers.filter(t => t.userId === req.userId).length })}\n\n`);
+  const userAllTrackers = trackers.filter(t => t.userId === req.userId);
+  res.write(`data: ${JSON.stringify({ type: 'init', trackers: userTrackers, totalTrackerCount: userAllTrackers.length, totalActiveTrackerCount: userAllTrackers.filter(t => t.active).length })}\n\n`);
 
   req.on('close', () => {
     sseClients.delete(clientId);
@@ -1240,6 +1242,14 @@ function authMiddleware(req, res, next) {
     req.role     = user.role || 'user';
     if (getSetting('maintenanceMode', '0') === '1' && req.role !== 'admin') {
       return res.status(503).json({ error: 'The site is currently undergoing maintenance. Please try again later.' });
+    }
+    // Reject non-admin sessions that were issued before the last "kill all sessions" action
+    if (req.role !== 'admin' && !payload.impersonatedBy) {
+      const killTs = parseInt(getSetting('sessionKilledAt', '0') || '0');
+      if (killTs > 0 && (payload.iat * 1000) < killTs) {
+        res.clearCookie('watchbot_auth');
+        return res.status(401).json({ error: 'Session terminated by administrator' });
+      }
     }
     next();
   } catch {
@@ -1402,8 +1412,12 @@ app.post('/api/auth/login', async (req, res) => {
 
   if (user.disabled) return res.status(403).json({ error: 'Your account has been deactivated. Please contact an administrator.' });
 
+  if (getSetting('maintenanceMode', '0') === '1' && (user.role || 'user') !== 'admin')
+    return res.status(503).json({ error: 'The site is currently under maintenance.' });
+
   const token = jwt.sign({ userId: user.id, username: user.username, role: user.role || 'user' }, JWT_SECRET, { expiresIn: '7d' });
   res.cookie('watchbot_auth', token, { httpOnly: true, sameSite: 'lax', maxAge: COOKIE_MAX_AGE });
+  res.clearCookie('watchbot_restore'); // clear any stale impersonation session
   res.json({
     id: user.id,
     username: user.username,
@@ -1755,7 +1769,8 @@ app.delete('/api/profiles/:id', authMiddleware, (req, res) => {
 
   // Broadcast updated tracker list (uses new activeProfileId from DB)
   const profileTrackers = getActiveProfileTrackers(req.userId);
-  broadcastToUser({ type: 'profile-switch', trackers: profileTrackers, activeProfileId: fallbackId, totalTrackerCount: trackers.filter(t => t.userId === req.userId).length }, req.userId);
+  const allUserTrackers = trackers.filter(t => t.userId === req.userId);
+  broadcastToUser({ type: 'profile-switch', trackers: profileTrackers, activeProfileId: fallbackId, totalTrackerCount: allUserTrackers.length, totalActiveTrackerCount: allUserTrackers.filter(t => t.active).length }, req.userId);
 
   res.json({ success: true, activeProfileId: fallbackId });
 });
@@ -1770,7 +1785,8 @@ app.post('/api/profiles/:id/switch', authMiddleware, (req, res) => {
   const profileTrackers = trackers
     .filter(t => t.userId === req.userId && t.profileId === profile.id)
     .map(({ lastBody, ...rest }) => rest);
-  broadcastToUser({ type: 'profile-switch', trackers: profileTrackers, activeProfileId: profile.id, totalTrackerCount: trackers.filter(t => t.userId === req.userId).length }, req.userId);
+  const allUserTrackers = trackers.filter(t => t.userId === req.userId);
+  broadcastToUser({ type: 'profile-switch', trackers: profileTrackers, activeProfileId: profile.id, totalTrackerCount: allUserTrackers.length, totalActiveTrackerCount: allUserTrackers.filter(t => t.active).length }, req.userId);
 
   res.json({ success: true, activeProfileId: profile.id });
 });
@@ -1790,6 +1806,7 @@ app.get('/api/admin/settings', adminMiddleware, (req, res) => {
 app.patch('/api/admin/settings', adminMiddleware, (req, res) => {
   const allowed = ['allowRegistration', 'aiEnabled', 'maintenanceMode', 'defaultTrackerLimit', 'historyRetentionCap', 'userIntervalOptions'];
   const VALID_INTERVALS = new Set([60000, 300000, 900000, 1800000, 3600000, 14400000, 21600000, 43200000, 86400000, 259200000, 604800000]);
+  let maintenanceTurnedOn = false;
   for (const key of allowed) {
     if (!(key in req.body)) continue;
     const val = req.body[key];
@@ -1803,9 +1820,48 @@ app.patch('/api/admin/settings', adminMiddleware, (req, res) => {
       setSetting(key, JSON.stringify(clean));
     } else {
       setSetting(key, typeof val === 'boolean' ? (val ? '1' : '0') : String(val));
+      if (key === 'maintenanceMode' && (val === true || val === '1'))
+        maintenanceTurnedOn = true;
     }
   }
+  // Push a maintenance_on event to all connected SSE clients so non-admin users
+  // are kicked out immediately without needing a page reload.
+  if (maintenanceTurnedOn) {
+    const msg = `data: ${JSON.stringify({ type: 'maintenance_on' })}\n\n`;
+    sseClients.forEach(({ res: clientRes }) => {
+      try { clientRes.write(msg); } catch {}
+    });
+  }
   res.json({ ok: true });
+});
+
+app.get('/api/admin/site-stats', adminMiddleware, (req, res) => {
+  const totalUsers   = db.prepare('SELECT COUNT(*) as c FROM users').get().c;
+  const activeUsers  = db.prepare('SELECT COUNT(*) as c FROM users WHERE disabled = 0').get().c;
+  const totalTrackers  = trackers.length;
+  const activeTrackers = trackers.filter(t => t.active).length;
+  const changedTrackers = trackers.filter(t => t.status === 'changed').length;
+  const sseConnections = sseClients.size;
+  res.json({ totalUsers, activeUsers, totalTrackers, activeTrackers, changedTrackers, sseConnections });
+});
+
+app.post('/api/admin/kill-all-sessions', adminMiddleware, (req, res) => {
+  // Record kill timestamp — authMiddleware rejects non-admin JWTs issued before this
+  setSetting('sessionKilledAt', String(Date.now()));
+
+  // Force-logout all non-admin SSE connections immediately
+  const msg = `data: ${JSON.stringify({ type: 'force_logout' })}\n\n`;
+  let count = 0;
+  sseClients.forEach((client, clientId) => {
+    if (client.userId === req.userId) return; // skip the calling admin's own connections
+    const clientUser = _selectUserForAuth.get(client.userId);
+    if (clientUser?.role === 'admin') return; // skip other admin connections too
+    try { client.res.write(msg); client.res.end(); } catch {}
+    sseClients.delete(clientId);
+    count++;
+  });
+
+  res.json({ ok: true, sessionsTerminated: count });
 });
 
 app.post('/api/admin/users', adminMiddleware, async (req, res) => {
@@ -2001,7 +2057,8 @@ app.delete('/api/admin/trackers/:id', adminMiddleware, (req, res) => {
     db.prepare('DELETE FROM trackers WHERE id = ?').run(tracker.id);
   })();
   trackers = trackers.filter(t => t.id !== tracker.id);
-  broadcastToUser({ type: 'update', trackers: getActiveProfileTrackers(targetUserId), totalTrackerCount: trackers.filter(t => t.userId === targetUserId).length }, targetUserId);
+  const remainingUserTrackers = trackers.filter(t => t.userId === targetUserId);
+  broadcastToUser({ type: 'update', trackers: getActiveProfileTrackers(targetUserId), totalTrackerCount: remainingUserTrackers.length, totalActiveTrackerCount: remainingUserTrackers.filter(t => t.active).length }, targetUserId);
   res.json({ success: true });
 });
 

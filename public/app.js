@@ -12,7 +12,8 @@ let _sseProbePending  = false;
 // Profiles state
 let profiles       = [];   // [{id, userId, name, isDefault, createdAt}]
 let activeProfileId = null; // currently active profile id
-let userTotalTrackerCount = 0; // total trackers across ALL profiles (updated from SSE)
+let userTotalTrackerCount = 0;       // total trackers across ALL profiles (updated from SSE)
+let userTotalActiveTrackerCount = 0; // active trackers across ALL profiles (updated from SSE)
 
 // ─── TOOLTIP ENGINE ──────────────────────────────────────────────────────────
 // Single floating element driven by event delegation — works for all elements
@@ -154,7 +155,7 @@ let adminTrackersSearchVal = '';
 let adminTrackersPage      = 0;
 let adminTrackersSelected  = new Set();
 let adminUsersSelected     = new Set();
-let _adminCache            = { users: null, trackers: null, userMap: null };
+let _adminCache            = { users: null, trackers: null, userMap: null, settings: null, siteStats: null };
 
 const PASSWORD_POLICY = Object.freeze({
   minLength: 10,
@@ -280,6 +281,21 @@ async function init() {
 }
 
 let _maintPollTimer = null;
+let _maintAdminClickCount = 0;
+let _maintAdminClickTimer = null;
+
+function _maintAdminClickHandler() {
+  _maintAdminClickCount++;
+  if (_maintAdminClickTimer) clearTimeout(_maintAdminClickTimer);
+  if (_maintAdminClickCount >= 5) {
+    _maintAdminClickCount = 0;
+    // Raise auth overlay above the maintenance overlay and show login form
+    document.getElementById('authOverlay').classList.add('maintenance-admin-login');
+    showAuthOverlay('login');
+  } else {
+    _maintAdminClickTimer = setTimeout(() => { _maintAdminClickCount = 0; }, 5000);
+  }
+}
 
 function showMaintenanceOverlay() {
   // Close any SSE connection first
@@ -292,6 +308,12 @@ function showMaintenanceOverlay() {
   overlay.classList.add('show');
   overlay.setAttribute('aria-hidden', 'false');
   document.body.classList.add('modal-open', 'maintenance-active');
+
+  // Secret admin login: clicking the maintenance title 5 times reveals the login form
+  _maintAdminClickCount = 0;
+  const titleEl = document.getElementById('maintTitle');
+  titleEl.removeEventListener('click', _maintAdminClickHandler);
+  titleEl.addEventListener('click', _maintAdminClickHandler);
 
   // Poll every 20 seconds — auto-dismiss when maintenance ends
   clearInterval(_maintPollTimer);
@@ -306,7 +328,18 @@ function showMaintenanceOverlay() {
       if (!s.maintenanceMode) {
         hideMaintenanceOverlay();
         siteSettings = s;
-        showAuthOverlay('login');
+        // Try to restore the existing session — the JWT cookie may still be valid
+        // since the server never invalidated it when maintenance mode was turned on.
+        let restored = false;
+        try {
+          const meRes = await fetch('/api/auth/me');
+          if (meRes?.ok) {
+            currentUser = await meRes.json();
+            showApp();
+            restored = true;
+          }
+        } catch {}
+        if (!restored) showAuthOverlay('login');
       } else if (el) {
         el.textContent = `Checking for updates… (${pollCount})`;
       }
@@ -317,10 +350,15 @@ function showMaintenanceOverlay() {
 function hideMaintenanceOverlay() {
   clearInterval(_maintPollTimer);
   _maintPollTimer = null;
+  _maintAdminClickCount = 0;
+  if (_maintAdminClickTimer) { clearTimeout(_maintAdminClickTimer); _maintAdminClickTimer = null; }
+  const titleEl = document.getElementById('maintTitle');
+  if (titleEl) titleEl.removeEventListener('click', _maintAdminClickHandler);
   const overlay = document.getElementById('maintenanceOverlay');
   overlay.classList.remove('show');
   overlay.setAttribute('aria-hidden', 'true');
   document.body.classList.remove('modal-open', 'maintenance-active');
+  document.getElementById('authOverlay').classList.remove('maintenance-admin-login');
 }
 
 // ─── AUTH UI ──────────────────────────────────────────────────────────────────
@@ -658,6 +696,10 @@ async function handleLogin(e) {
     const data = await res.json();
     if (!res.ok) { errorEl.textContent = data.error || 'Login failed'; return; }
     currentUser = data;
+    // If the maintenance overlay was open (admin secret login), dismiss it
+    if (document.getElementById('maintenanceOverlay').classList.contains('show')) {
+      hideMaintenanceOverlay();
+    }
     showApp();
     if (currentUser.emailVerified === false) {
       showSnackbar('Your email is not verified yet. Use Account settings to send a verification email.');
@@ -723,7 +765,7 @@ let adminCurrentTab = 'users';
 
 async function openAdminPanel() {
   // Clear cache and reset search/page/selection state every time the panel opens
-  _adminCache            = { users: null, trackers: null, userMap: null, settings: null };
+  _adminCache            = { users: null, trackers: null, userMap: null, settings: null, siteStats: null };
   adminUsersSearchVal    = '';
   adminUsersPage         = 0;
   adminTrackersSearchVal = '';
@@ -759,6 +801,7 @@ function switchAdminTab(tab) {
   document.getElementById('adminUsersTab').style.display    = tab === 'users'    ? '' : 'none';
   document.getElementById('adminTrackersTab').style.display = tab === 'trackers' ? '' : 'none';
   document.getElementById('adminSettingsTab').style.display = tab === 'settings' ? '' : 'none';
+  document.getElementById('adminSiteTab').style.display     = tab === 'site'     ? '' : 'none';
   // Reset to page 0 each time a tab is (re-)selected
   if (tab === 'users') adminUsersPage = 0;
   else if (tab === 'trackers') adminTrackersPage = 0;
@@ -773,6 +816,17 @@ async function loadAdminTab(tab, forceRefresh = true) {
       _adminCache.settings = await res.json();
     }
     renderAdminSettingsTab(_adminCache.settings);
+    return;
+  }
+  if (tab === 'site') {
+    const [statsRes, settingsRes] = await Promise.all([
+      fetch('/api/admin/site-stats'),
+      (forceRefresh || !_adminCache.settings) ? fetch('/api/admin/settings') : Promise.resolve(null),
+    ]);
+    if (!statsRes.ok) return;
+    _adminCache.siteStats = await statsRes.json();
+    if (settingsRes?.ok) _adminCache.settings = await settingsRes.json();
+    renderAdminSiteTab(_adminCache.siteStats, _adminCache.settings || {});
     return;
   }
   if (tab === 'users') {
@@ -829,17 +883,6 @@ function renderAdminSettingsTab(s) {
         </div>
 
         <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding-bottom:16px;border-bottom:1px solid var(--divider)">
-          <div>
-            <div style="font-size:14px;font-weight:600">Maintenance mode</div>
-            <div style="font-size:12px;color:var(--on-surface-medium);margin-top:3px">Logs out all non-admin users and displays "Maintenance in progress" message. Non-admin users can not login during maintenance. Admins are unaffected.</div>
-          </div>
-          <label class="toggle" style="flex-shrink:0;margin-top:2px" data-tip="${s.maintenanceMode ? 'Disable maintenance mode' : 'Enable maintenance mode'}">
-            <input type="checkbox" ${s.maintenanceMode ? 'checked' : ''} onchange="saveAdminSetting('maintenanceMode', this.checked)">
-            <span class="toggle-slider"></span>
-          </label>
-        </div>
-
-        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding-bottom:16px;border-bottom:1px solid var(--divider)">
           <div style="flex:1">
             <div style="font-size:14px;font-weight:600">Default WatchBot limit</div>
             <div style="font-size:12px;color:var(--on-surface-medium);margin-top:3px">Max WatchBots per user when no per-user override is set. <strong>0</strong> = unlimited.</div>
@@ -891,6 +934,80 @@ function renderAdminSettingsTab(s) {
   `;
 }
 
+function renderAdminSiteTab(stats, settings) {
+  const el = document.getElementById('adminSiteTab');
+  if (!el) return;
+  const s = settings || {};
+  const maintOn = !!s.maintenanceMode;
+  el.innerHTML = `
+    <div style="max-width:560px;display:flex;flex-direction:column;gap:28px">
+
+      <div>
+        <h4 style="font-size:13px;font-weight:700;color:var(--on-surface-medium);text-transform:uppercase;letter-spacing:0.6px;margin:0 0 14px">Site Overview</h4>
+        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px">
+          ${[
+            { label: 'Total users',       value: stats.totalUsers,     icon: 'group' },
+            { label: 'Active users',      value: stats.activeUsers,    icon: 'how_to_reg' },
+            { label: 'Total WatchBots',   value: stats.totalTrackers,  icon: 'radar' },
+            { label: 'Active WatchBots',  value: stats.activeTrackers, icon: 'play_circle' },
+            { label: 'Unread changes',    value: stats.changedTrackers, icon: 'notifications_active' },
+            { label: 'Live connections',  value: stats.sseConnections, icon: 'wifi' },
+          ].map(item => `
+            <div style="background:var(--surface-variant,var(--surface));border:1px solid var(--divider);border-radius:10px;padding:14px 16px;display:flex;flex-direction:column;gap:4px">
+              <span class="material-icons" style="font-size:18px;color:var(--primary)">${item.icon}</span>
+              <div style="font-size:22px;font-weight:700;line-height:1.1">${item.value ?? '—'}</div>
+              <div style="font-size:11px;color:var(--on-surface-medium);font-weight:500">${item.label}</div>
+            </div>
+          `).join('')}
+        </div>
+        <button onclick="loadAdminTab('site')" style="margin-top:10px;padding:5px 14px;font-family:inherit;font-size:12px;font-weight:600;border:1px solid var(--divider);border-radius:8px;background:var(--surface);color:var(--on-surface-medium);cursor:pointer">
+          <span class="material-icons" style="font-size:14px;vertical-align:-3px;margin-right:4px">refresh</span>Refresh
+        </button>
+      </div>
+
+      <div style="display:flex;flex-direction:column;gap:18px">
+        <h4 style="font-size:13px;font-weight:700;color:var(--on-surface-medium);text-transform:uppercase;letter-spacing:0.6px;margin:0">Site Controls</h4>
+
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding-bottom:16px;border-bottom:1px solid var(--divider)">
+          <div>
+            <div style="font-size:14px;font-weight:600">Maintenance mode</div>
+            <div style="font-size:12px;color:var(--on-surface-medium);margin-top:3px">Kicks all non-admin users out immediately and blocks non-admin logins until disabled. Admins are unaffected.</div>
+          </div>
+          <label class="toggle" style="flex-shrink:0;margin-top:2px" data-tip="${maintOn ? 'Disable maintenance mode' : 'Enable maintenance mode'}">
+            <input type="checkbox" ${maintOn ? 'checked' : ''} onchange="saveAdminSetting('maintenanceMode', this.checked)">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding-bottom:16px;border-bottom:1px solid var(--divider)">
+          <div>
+            <div style="font-size:14px;font-weight:600">Kill all user sessions</div>
+            <div style="font-size:12px;color:var(--on-surface-medium);margin-top:3px">Immediately terminates all active non-admin sessions and invalidates any existing non-admin login tokens. Users will need to log in again.</div>
+          </div>
+          <button onclick="adminKillAllSessions()"
+            style="flex-shrink:0;padding:7px 14px;font-family:inherit;font-size:13px;font-weight:600;border-radius:8px;cursor:pointer;border:1.5px solid var(--error);background:transparent;color:var(--error);white-space:nowrap">
+            <span class="material-icons" style="font-size:15px;vertical-align:-3px;margin-right:4px">no_accounts</span>Kill sessions
+          </button>
+        </div>
+      </div>
+
+    </div>
+  `;
+}
+
+async function adminKillAllSessions() {
+  if (!confirm('Terminate all non-admin user sessions? Users will be logged out immediately and their tokens invalidated.')) return;
+  try {
+    const res = await fetch('/api/admin/kill-all-sessions', { method: 'POST' });
+    if (!res.ok) throw new Error();
+    const data = await res.json();
+    showSnackbar(`Sessions terminated (${data.sessionsTerminated} active connection${data.sessionsTerminated === 1 ? '' : 's'} closed)`);
+    loadAdminTab('site');
+  } catch {
+    showSnackbar('Failed to kill sessions', 'error');
+  }
+}
+
 async function saveAdminSetting(key, value) {
   try {
     const res = await fetch('/api/admin/settings', {
@@ -909,6 +1026,10 @@ async function saveAdminSetting(key, value) {
       siteSettings.userIntervalOptions = parsed;
       _refreshIntervalSelects();
       if (_adminCache.settings) renderAdminSettingsTab(_adminCache.settings);
+    }
+    // Re-render the site tab if it is currently active and a site-level control changed
+    if (key === 'maintenanceMode' && adminCurrentTab === 'site' && _adminCache.settings) {
+      renderAdminSiteTab(_adminCache.siteStats || {}, _adminCache.settings);
     }
     showSnackbar('Setting saved');
   } catch {
@@ -2043,10 +2164,25 @@ function connectSSE() {
       currentUser = null;
       trackers    = [];
       userTotalTrackerCount = 0;
+      userTotalActiveTrackerCount = 0;
       renderTrackers();
       updateBadge();
       document.getElementById('userArea').style.display = 'none';
       showAuthOverlay('login');
+      return;
+    }
+    if (data.type === 'maintenance_on') {
+      siteSettings.maintenanceMode = true;
+      if (currentUser?.role !== 'admin') {
+        if (evtSource) { evtSource.close(); evtSource = null; }
+        currentUser = null;
+        trackers    = [];
+        userTotalTrackerCount = 0;
+        userTotalActiveTrackerCount = 0;
+        renderTrackers();
+        updateBadge();
+        showMaintenanceOverlay();
+      }
       return;
     }
     if (data.type === 'profile-switch') {
@@ -2057,6 +2193,7 @@ function connectSSE() {
       }
       trackers = data.trackers || [];
       if (data.totalTrackerCount !== undefined) userTotalTrackerCount = data.totalTrackerCount;
+      if (data.totalActiveTrackerCount !== undefined) userTotalActiveTrackerCount = data.totalActiveTrackerCount;
       // Clear per-tracker history cache so switching profiles shows fresh data
       Object.keys(_tcCache).forEach(k => delete _tcCache[k]);
       renderTrackers();
@@ -2075,6 +2212,7 @@ function connectSSE() {
         // Full replace on initial load
         trackers = data.trackers;
         if (data.totalTrackerCount !== undefined) userTotalTrackerCount = data.totalTrackerCount;
+        if (data.totalActiveTrackerCount !== undefined) userTotalActiveTrackerCount = data.totalActiveTrackerCount;
       } else {
         // Merge update by id, preserving client's current order
         const incoming = new Map(data.trackers.map(t => [t.id, t]));
@@ -2085,6 +2223,7 @@ function connectSSE() {
         const existingIds = new Set(trackers.map(t => t.id));
         data.trackers.forEach(t => { if (!existingIds.has(t.id)) trackers.unshift(t); });
         if (data.totalTrackerCount !== undefined) userTotalTrackerCount = data.totalTrackerCount;
+        if (data.totalActiveTrackerCount !== undefined) userTotalActiveTrackerCount = data.totalActiveTrackerCount;
       }
       if (data.type === 'update') {
         // Invalidate cache when history grows, regardless of tracker status.
@@ -3290,8 +3429,27 @@ function trackerHTML(t) {
 
 function updateBadge() {
   const limit = currentUser && currentUser.trackerLimit ? currentUser.trackerLimit : null;
-  const limitStr = limit ? limit : '<span style="font-size:22px;line-height:1;vertical-align:middle">∞</span>';
-  document.getElementById('activeCount').innerHTML = `${userTotalTrackerCount} / ${limitStr}`;
+  const limitNum = limit != null ? limit : '∞';
+  const active = userTotalActiveTrackerCount;
+  const total  = userTotalTrackerCount;
+  const paused = total - active;
+
+  const el = document.getElementById('activeCount');
+  el.innerHTML =
+    '<span class="tbc-seg-active">' +
+      '<span class="material-icons" style="font-size:13px;line-height:1;opacity:0.9">play_circle</span>' +
+      active +
+    '</span>' +
+    '<span class="tbc-seg-total">' + total + ' / ' + limitNum + '</span>';
+
+  const tipParts = [
+    active + ' active WatchBot' + (active === 1 ? '' : 's'),
+    paused > 0 ? paused + ' paused' : null,
+    total + ' total across all profiles',
+    limit != null ? 'Limit: ' + limit : 'No tracker limit',
+  ].filter(Boolean).join('  ·  ');
+  el.setAttribute('data-tip', tipParts);
+
   const btn = document.getElementById('dismissAllBtn');
   if (btn) btn.style.display = trackers.some(t => t.status === 'changed') ? '' : 'none';
   const hasHistory = trackers.some(t => t.changeCount > 0);

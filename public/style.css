@@ -54,12 +54,28 @@
   .topbar h1 span { color: var(--primary); }
   .topbar-spacer { flex: 1; }
   .topbar-badge {
-    background: var(--primary-light);
-    color: var(--primary);
+    display: inline-flex;
+    align-items: center;
     font-size: 12px;
     font-weight: 600;
-    padding: 4px 10px;
     border-radius: 20px;
+    overflow: hidden;
+    cursor: default;
+    user-select: none;
+    white-space: nowrap;
+  }
+  .tbc-seg-active {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    padding: 4px 8px 4px 10px;
+    background: var(--primary);
+    color: #fff;
+  }
+  .tbc-seg-total {
+    padding: 4px 10px 4px 7px;
+    background: var(--primary-light);
+    color: var(--primary);
   }
 
   /* LAYOUT */
@@ -802,6 +818,10 @@
   .auth-overlay.show {
     opacity: 1;
     pointer-events: auto;
+  }
+  /* Raised above the maintenance overlay so admins can log in during maintenance */
+  .auth-overlay.maintenance-admin-login {
+    z-index: 700;
   }
   .auth-dialog {
     width: min(400px, 100%);
