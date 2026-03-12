@@ -2079,6 +2079,19 @@ function connectSSE() {
       showAuthOverlay('login');
       return;
     }
+    if (data.type === 'maintenance_on') {
+      siteSettings.maintenanceMode = true;
+      if (currentUser?.role !== 'admin') {
+        if (evtSource) { evtSource.close(); evtSource = null; }
+        currentUser = null;
+        trackers    = [];
+        userTotalTrackerCount = 0;
+        renderTrackers();
+        updateBadge();
+        showMaintenanceOverlay();
+      }
+      return;
+    }
     if (data.type === 'profile-switch') {
       // Full replace with the new profile's trackers; update active profile state
       if (data.activeProfileId) {

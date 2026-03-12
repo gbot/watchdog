@@ -1794,6 +1794,7 @@ app.get('/api/admin/settings', adminMiddleware, (req, res) => {
 app.patch('/api/admin/settings', adminMiddleware, (req, res) => {
   const allowed = ['allowRegistration', 'aiEnabled', 'maintenanceMode', 'defaultTrackerLimit', 'historyRetentionCap', 'userIntervalOptions'];
   const VALID_INTERVALS = new Set([60000, 300000, 900000, 1800000, 3600000, 14400000, 21600000, 43200000, 86400000, 259200000, 604800000]);
+  let maintenanceTurnedOn = false;
   for (const key of allowed) {
     if (!(key in req.body)) continue;
     const val = req.body[key];
@@ -1807,7 +1808,17 @@ app.patch('/api/admin/settings', adminMiddleware, (req, res) => {
       setSetting(key, JSON.stringify(clean));
     } else {
       setSetting(key, typeof val === 'boolean' ? (val ? '1' : '0') : String(val));
+      if (key === 'maintenanceMode' && (val === true || val === '1'))
+        maintenanceTurnedOn = true;
     }
+  }
+  // Push a maintenance_on event to all connected SSE clients so non-admin users
+  // are kicked out immediately without needing a page reload.
+  if (maintenanceTurnedOn) {
+    const msg = `data: ${JSON.stringify({ type: 'maintenance_on' })}\n\n`;
+    sseClients.forEach(({ res: clientRes }) => {
+      try { clientRes.write(msg); } catch {}
+    });
   }
   res.json({ ok: true });
 });
