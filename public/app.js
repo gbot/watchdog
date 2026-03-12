@@ -327,7 +327,18 @@ function showMaintenanceOverlay() {
       if (!s.maintenanceMode) {
         hideMaintenanceOverlay();
         siteSettings = s;
-        showAuthOverlay('login');
+        // Try to restore the existing session — the JWT cookie may still be valid
+        // since the server never invalidated it when maintenance mode was turned on.
+        let restored = false;
+        try {
+          const meRes = await fetch('/api/auth/me');
+          if (meRes?.ok) {
+            currentUser = await meRes.json();
+            showApp();
+            restored = true;
+          }
+        } catch {}
+        if (!restored) showAuthOverlay('login');
       } else if (el) {
         el.textContent = `Checking for updates… (${pollCount})`;
       }
