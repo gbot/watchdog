@@ -3349,9 +3349,11 @@ function trackerHTML(t) {
                     t.status === 'error'    ? 'Error' :
                     t.status === 'ok'       ? 'No changes' : 'Pending';
 
-  const lastCheck    = t.lastCheck ? 'Last: ' + new Date(t.lastCheck).toLocaleTimeString() : 'Never checked';
-  const timeAgoStr   = t.lastCheck ? timeAgo(t.lastCheck) : '';
   const intervalLabel = intervalText(t.interval);
+  const lastCheckTs  = t.lastCheck ? new Date(t.lastCheck) : null;
+  const nextCheckTs  = lastCheckTs ? new Date(lastCheckTs.getTime() + t.interval) : null;
+  const lastCheckFull = lastCheckTs ? lastCheckTs.toLocaleString() : 'Never';
+  const nextCheckFull = nextCheckTs ? nextCheckTs.toLocaleString() : 'Unknown';
 
   let changeBanner = '';
   if (t.status === 'error' && t.changeSummary) {
@@ -3377,15 +3379,17 @@ function trackerHTML(t) {
           <div class="tracker-url">${escHtml(t.url)}</div>
         </div>
       </div>
-      <span class="chip ${chipClass}" style="margin-right:8px">${chipLabel}</span>
+      <span class="chip ${chipClass}">${chipLabel}</span>
+      ${(t.aiSummary !== false || t.emailNotify) ? `<div class="tracker-meta-icons">
+        ${t.aiSummary !== false ? `<div data-tip="AI summary enabled" class="tracker-meta-icon"><span class="material-icons" style="font-size:13px">auto_awesome</span></div>` : ''}
+        ${t.emailNotify ? `<div data-tip="Email notifications enabled" class="tracker-meta-icon"><span class="material-icons" style="font-size:13px">email</span></div>` : ''}
+      </div><div class="tracker-meta-pipe"></div>` : ''}
       <div class="tracker-meta">
-        <div class="tracker-interval"><span class="material-icons">schedule</span>${intervalLabel}</div>
-        <div class="tracker-last-check">${lastCheck}</div>
-        ${timeAgoStr ? `<div class="tracker-time-ago" data-ts="${t.lastCheck}">${timeAgoStr}</div>` : ''}
-        <div data-tip="${t.aiSummary !== false ? 'AI summary enabled' : 'AI summary disabled'}" style="display:flex;align-items:center;gap:3px;font-size:11px;${t.aiSummary !== false ? 'color:var(--primary);opacity:0.75' : 'color:var(--on-surface-medium);opacity:0.45'}">
-          <span class="material-icons" style="font-size:13px">auto_awesome</span>AI
+        <div class="tracker-times">
+          <div class="tracker-interval">${intervalLabel}<span class="material-icons">schedule</span></div>
+          <div class="tracker-time-item"${lastCheckTs ? ` data-ts="${t.lastCheck}"` : ''} data-tip="Last run: ${lastCheckFull}"><span class="tracker-time-text">${lastCheckTs ? timeAgo(t.lastCheck) : 'Never'}</span><span class="material-icons tracker-time-icon">history</span></div>
+          <div class="tracker-time-next"${nextCheckTs ? ` data-next-ts="${nextCheckTs.toISOString()}"` : ''} data-tip="Next run: ${nextCheckFull}"><span class="tracker-time-text">${nextCheckTs ? timeUntil(nextCheckTs.toISOString()) : '—'}</span><span class="material-icons tracker-time-icon">update</span></div>
         </div>
-        ${t.emailNotify ? `<div data-tip="Email notifications enabled" style="display:flex;align-items:center;gap:3px;font-size:11px;color:var(--primary);opacity:0.75"><span class="material-icons" style="font-size:13px">email</span></div>` : ''}
       </div>
       <div class="tracker-actions">
         <label class="toggle" data-tip="${t.active ? 'Pause' : 'Resume'} tracker">
@@ -3838,10 +3842,26 @@ function timeAgo(isoString) {
   return `${days} day${days === 1 ? '' : 's'} ago`;
 }
 
+function timeUntil(isoString) {
+  const ms   = new Date(isoString) - Date.now();
+  const secs = Math.floor(ms / 1000);
+  if (secs <= 0)   return 'now';
+  if (secs < 60)   return `in ${secs}s`;
+  const mins = Math.floor(secs / 60);
+  if (mins < 60)   return `in ${mins} min${mins === 1 ? '' : 's'}`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24)    return `in ${hrs} hr${hrs === 1 ? '' : 's'}`;
+  const days = Math.floor(hrs / 24);
+  return `in ${days} day${days === 1 ? '' : 's'}`;
+}
+
 // Refresh all relative timestamps every 30 seconds
 setInterval(() => {
-  document.querySelectorAll('.tracker-time-ago[data-ts]').forEach(el => {
-    el.textContent = timeAgo(el.dataset.ts);
+  document.querySelectorAll('.tracker-time-item[data-ts]').forEach(el => {
+    if (el.dataset.ts) el.querySelector('.tracker-time-text').textContent = timeAgo(el.dataset.ts);
+  });
+  document.querySelectorAll('.tracker-time-next[data-next-ts]').forEach(el => {
+    if (el.dataset.nextTs) el.querySelector('.tracker-time-text').textContent = timeUntil(el.dataset.nextTs);
   });
 }, 30000);
 
