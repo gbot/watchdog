@@ -3383,12 +3383,12 @@ function trackerHTML(t) {
       ${(t.aiSummary !== false || t.emailNotify) ? `<div class="tracker-meta-icons">
         ${t.aiSummary !== false ? `<div data-tip="AI summary enabled" class="tracker-meta-icon"><span class="material-icons" style="font-size:13px">auto_awesome</span></div>` : ''}
         ${t.emailNotify ? `<div data-tip="Email notifications enabled" class="tracker-meta-icon"><span class="material-icons" style="font-size:13px">email</span></div>` : ''}
-      </div>` : ''}
+      </div><div class="tracker-meta-pipe"></div>` : ''}
       <div class="tracker-meta">
         <div class="tracker-times">
-          <div class="tracker-interval"><span class="material-icons">schedule</span>${intervalLabel}</div>
-          <div class="tracker-time-item"${lastCheckTs ? ` data-ts="${t.lastCheck}"` : ''} data-tip="Last run: ${lastCheckFull}">${lastCheckTs ? timeAgo(t.lastCheck) : 'Never'}</div>
-          <div class="tracker-time-next"${nextCheckTs ? ` data-next-ts="${nextCheckTs.toISOString()}"` : ''} data-tip="Next run: ${nextCheckFull}">${nextCheckTs ? timeUntil(nextCheckTs.toISOString()) : '—'}</div>
+          <div class="tracker-interval">${intervalLabel}<span class="material-icons">schedule</span></div>
+          <div class="tracker-time-item"${lastCheckTs ? ` data-ts="${t.lastCheck}"` : ''} data-tip="Last run: ${lastCheckFull}">${lastCheckTs ? timeAgo(t.lastCheck) : 'Never'}<span class="material-icons tracker-time-icon">history</span></div>
+          <div class="tracker-time-next"${nextCheckTs ? ` data-next-ts="${nextCheckTs.toISOString()}"` : ''} data-tip="Next run: ${nextCheckFull}">${nextCheckTs ? timeUntil(nextCheckTs.toISOString()) : '—'}<span class="material-icons tracker-time-icon">update</span></div>
         </div>
       </div>
       <div class="tracker-actions">
@@ -3858,10 +3858,10 @@ function timeUntil(isoString) {
 // Refresh all relative timestamps every 30 seconds
 setInterval(() => {
   document.querySelectorAll('.tracker-time-item[data-ts]').forEach(el => {
-    if (el.dataset.ts) el.textContent = timeAgo(el.dataset.ts);
+    if (el.dataset.ts) el.firstChild.textContent = timeAgo(el.dataset.ts);
   });
   document.querySelectorAll('.tracker-time-next[data-next-ts]').forEach(el => {
-    if (el.dataset.nextTs) el.textContent = timeUntil(el.dataset.nextTs);
+    if (el.dataset.nextTs) el.firstChild.textContent = timeUntil(el.dataset.nextTs);
   });
 }, 30000);
 

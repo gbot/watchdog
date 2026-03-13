@@ -307,24 +307,30 @@
   }
   .tracker-interval {
     font-size: 12px; color: var(--on-surface-medium);
-    display: flex; align-items: center; gap: 4px; white-space: nowrap;
+    display: flex; align-items: center; justify-content: space-between; gap: 6px; white-space: nowrap;
   }
-  .tracker-interval .material-icons { font-size: 14px; }
+  .tracker-interval .material-icons { font-size: 14px; flex-shrink: 0; }
   .tracker-meta-icons {
     display: flex; align-items: center; gap: 5px;
   }
   .tracker-meta-icon {
     display: flex; align-items: center; color: var(--primary); opacity: 0.75;
   }
+  .tracker-meta-pipe {
+    width: 1px; height: 14px; background: var(--on-surface-light); opacity: 0.4; flex-shrink: 0;
+  }
   .tracker-times {
-    display: flex; flex-direction: column; align-items: flex-end; gap: 2px;
+    display: flex; flex-direction: column; align-items: stretch; gap: 2px;
   }
   .tracker-time-item {
     font-size: 11px; color: var(--on-surface-light); white-space: nowrap; cursor: default;
+    display: flex; align-items: center; justify-content: space-between; gap: 6px;
   }
   .tracker-time-next {
     font-size: 10px; color: var(--on-surface-light); opacity: 0.7; white-space: nowrap; cursor: default;
+    display: flex; align-items: center; justify-content: space-between; gap: 6px;
   }
+  .tracker-time-icon { font-size: 12px !important; flex-shrink: 0; }
 
   .tracker-actions { display: flex; align-items: center; gap: 1px; }
   .tracker-action-icon { font-size: 17px !important; padding: 4px !important; }
